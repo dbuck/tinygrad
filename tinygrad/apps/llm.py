@@ -101,17 +101,17 @@ class GatedDeltaNetBlock:
     self.gqa_factor = num_v_heads // num_k_heads
 
     # Input projections
-    self.attn_qkv = nn.Linear(dim, conv_dim, bias=False)    # Q+K+V (goes through conv1d)
-    self.attn_gate = nn.Linear(dim, value_dim, bias=False)   # z gate (does NOT go through conv1d)
-    self.ssm_beta = nn.Linear(dim, num_v_heads, bias=False)  # update rate -> sigmoid
-    self.ssm_alpha = nn.Linear(dim, num_v_heads, bias=False) # decay input -> softplus
+    self.attn_qkv = linear(dim, conv_dim, bias=False)        # Q+K+V (goes through conv1d)
+    self.attn_gate = linear(dim, value_dim, bias=False)      # z gate (does NOT go through conv1d)
+    self.ssm_beta = linear(dim, num_v_heads, bias=False)     # update rate -> sigmoid
+    self.ssm_alpha = linear(dim, num_v_heads, bias=False)    # decay input -> softplus
 
     # SSM parameters
     self.ssm_a = Tensor.zeros(num_v_heads)                   # -exp(A_log), stored post-negation in GGUF
     self.ssm_dt = Tensor.zeros(num_v_heads)                  # dt_bias (stored as ssm_dt.bias in GGUF)
     self.ssm_conv1d = Tensor.zeros(d_conv, conv_dim)         # depthwise conv kernel
     self.ssm_norm = nn.RMSNorm(head_v_dim, norm_eps)         # gated output norm
-    self.ssm_out = nn.Linear(value_dim, dim, bias=False)     # output projection
+    self.ssm_out = linear(value_dim, dim, bias=False)        # output projection
 
     # Norms
     self.attn_norm = nn.RMSNorm(dim, norm_eps)
