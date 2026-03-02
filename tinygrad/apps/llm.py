@@ -293,18 +293,19 @@ class GatedDeltaNetBlock:
 class TransformerBlock:
   def __init__(self, dim:int, hidden_dim:int, n_heads:int, n_kv_heads:int, norm_eps:float, head_dim:int, rope_theta:float,
                max_context:int=0, qk_norm:int=0, num_experts:int=0, num_experts_per_tok:int=0,
-               shared_hidden_dim:int=0, linear=nn.Linear, expert_weights_cls=None):
+               shared_hidden_dim:int=0, linear=nn.Linear, expert_weights_cls=None, gated_attn:bool=False):
     self.n_heads      = n_heads
     self.n_kv_heads   = n_kv_heads
     self.head_dim     = head_dim
     self.rope_theta   = rope_theta
     self.max_context  = max_context
     self.qk_norm      = qk_norm
+    self.gated_attn   = gated_attn
 
     # --- attention projections (all linear, bias-free) ------------------
     q_proj_out       = self.head_dim * n_heads
     kv_proj_out      = self.head_dim * n_kv_heads
-    self.attn_q      = linear(dim, q_proj_out,  bias=False)
+    self.attn_q      = linear(dim, q_proj_out * (2 if gated_attn else 1),  bias=False)
     self.attn_k      = linear(dim, kv_proj_out, bias=False)
     self.attn_v      = linear(dim, kv_proj_out, bias=False)
     self.attn_output = linear(q_proj_out, dim,  bias=False)
@@ -335,11 +336,19 @@ class TransformerBlock:
   @function
   def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor:
     x_norm = self.attn_norm(x)                       # (B,T,D)
-    q, k, v = self.attn_q(x_norm), self.attn_k(x_norm), self.attn_v(x_norm)
-    if self.qk_norm and self.qk_norm != self.head_dim: q, k = self.attn_q_norm(q), self.attn_k_norm(k)
+    q_out, k, v = self.attn_q(x_norm), self.attn_k(x_norm), self.attn_v(x_norm)
 
     B, T, _ = x.shape
-    q = q.reshape(B, T, self.n_heads,    self.head_dim).transpose(1, 2)  # (B,H,T,Hd)
+    if self.gated_attn:
+      # Gated attention: attn_q outputs Q and gate concatenated (2× width)
+      q_out = q_out.reshape(B, T, self.n_heads, self.head_dim * 2)
+      q, gate = q_out[:, :, :, :self.head_dim], q_out[:, :, :, self.head_dim:]  # each (B,T,H,Hd)
+      gate = gate.reshape(B, T, -1)  # (B,T,H*Hd) for later application
+      q = q.transpose(1, 2)  # (B,H,T,Hd)
+    else:
+      q = q_out.reshape(B, T, self.n_heads, self.head_dim).transpose(1, 2)  # (B,H,T,Hd)
+
+    if self.qk_norm and self.qk_norm != self.head_dim: q, k = self.attn_q_norm(q), self.attn_k_norm(k)
     k = k.reshape(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)  # (B,KvH,T,Hd)
     v = v.reshape(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)  # (B,KvH,T,Hd)
     if self.qk_norm == self.head_dim: q, k = self.attn_q_norm(q), self.attn_k_norm(k)
@@ -362,6 +371,7 @@ class TransformerBlock:
     mask = Tensor.full((1, 1, T, start_pos+T), float("-inf"), dtype=x.dtype, device=x.device).triu(int(start_pos)+1) if T > 1 else None
     attn = q.scaled_dot_product_attention(k, v, attn_mask=mask, enable_gqa=True)     # (B,H,T,Hd)
     attn = attn.transpose(1, 2).reshape(B, T, -1)                                    # back to (B,T,D)
+    if self.gated_attn: attn = attn * gate.sigmoid()
     attn = self.attn_output(attn)
     return x + attn
 
@@ -500,10 +510,10 @@ class Transformer:
       blocks = []
       for i in range(num_blocks):
         if (i + 1) % full_attn_interval == 0:
-          # Full attention block (every Nth layer)
+          # Full attention block (every Nth layer) — Qwen3.5 uses gated attention
           blocks.append(TransformerBlock(dim, hidden_dim, n_heads, n_kv_heads, norm_eps, head_dim, rope_theta,
                                          max_context, qk_norm, num_experts, num_experts_per_tok, shared_hidden_dim,
-                                         linear, expert_weights_cls))
+                                         linear, expert_weights_cls, gated_attn=True))
         else:
           # DeltaNet SSM block
           blocks.append(GatedDeltaNetBlock(dim, hidden_dim, norm_eps, num_experts=num_experts,
