@@ -423,10 +423,10 @@ class Transformer:
     # Try Q4_0-aware loader for memory-efficient loading of quantized models
     try:
       from q4_0_linear import Q4_0Linear, Q4_0ExpertWeights, gguf_load_q4_0, dequant_q4_0_blocks, tensor_to_q4_0_blocks
-      kv, state_dict, tensor_info = gguf_load_q4_0(gguf.to(None))
+      kv, state_dict, tensor_info = gguf_load_q4_0(gguf)
       has_q4_0 = any(t[0] == 2 for t in tensor_info.values())
     except ImportError:
-      kv, state_dict = nn.state.gguf_load(gguf.to(None))
+      kv, state_dict = nn.state.gguf_load(gguf)
       has_q4_0, tensor_info = False, {}
 
     if has_q4_0:
