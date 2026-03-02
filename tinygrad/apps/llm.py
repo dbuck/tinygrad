@@ -470,6 +470,10 @@ class Transformer:
       else:
         state_dict['output.weight'] = state_dict['token_embd.weight']
 
+    # Ensure token_embd is always dense (embedding needs random access per token, not Q4_0 matmul)
+    if has_q4_0 and tensor_info.get('token_embd.weight', (None,))[0] == 2 and state_dict['token_embd.weight'].dtype == dtypes.uint8:
+      state_dict['token_embd.weight'] = dequant_q4_0_blocks(state_dict['token_embd.weight'], vocab_size, dim)
+
     # Detect hybrid architecture (DeltaNet + attention)
     is_hybrid = kv.get(f'{arch}.full_attention_interval', 0) > 0
     full_attn_interval = kv.get(f'{arch}.full_attention_interval', 0)
