@@ -88,7 +88,7 @@ class GatedDeltaNetBlock:
   """Gated DeltaNet block: linear-time recurrence with delta rule, replacing attention in hybrid models."""
   def __init__(self, dim:int, hidden_dim:int, norm_eps:float, num_v_heads:int, num_k_heads:int,
                head_k_dim:int, head_v_dim:int, d_conv:int, num_experts:int=0, num_experts_per_tok:int=0,
-               linear=nn.Linear, expert_weights_cls=None):
+               shared_hidden_dim:int=0, linear=nn.Linear, expert_weights_cls=None):
     self.num_v_heads = num_v_heads
     self.num_k_heads = num_k_heads
     self.head_k_dim = head_k_dim
@@ -126,6 +126,11 @@ class GatedDeltaNetBlock:
       self.ffn_gate_exps = _ew(num_experts, dim, hidden_dim)
       self.ffn_up_exps = _ew(num_experts, dim, hidden_dim)
       self.ffn_down_exps = _ew(num_experts, hidden_dim, dim)
+      if shared_hidden_dim > 0:
+        self.ffn_gate_shexp = linear(dim, shared_hidden_dim, bias=False)
+        self.ffn_up_shexp = linear(dim, shared_hidden_dim, bias=False)
+        self.ffn_down_shexp = linear(shared_hidden_dim, dim, bias=False)
+        self.ffn_gate_inp_shexp = Tensor.zeros(1)  # scalar sigmoid gate
 
   def _deltanet_recurrent(self, q:Tensor, k:Tensor, v:Tensor, g:Tensor, beta:Tensor) -> Tensor:
     """Single-token autoregressive delta rule recurrence. Uses uop.assign pattern (no realize).
@@ -210,9 +215,12 @@ class GatedDeltaNetBlock:
 
     # Save final state and conv state for subsequent autoregressive
     self.ssm_state.assign(S.contiguous()).realize()
-    self.conv_state.assign(
-      qkv_raw.permute(0, 2, 1)[:, :, -(self.d_conv):].contiguous()
-    ).realize()
+    conv_input = qkv_raw.permute(0, 2, 1)  # (B, C, T)
+    if T < self.d_conv:
+      conv_input = Tensor.zeros(B, self.conv_dim, self.d_conv - T, device=x.device).cat(conv_input, dim=-1)
+    else:
+      conv_input = conv_input[:, :, -self.d_conv:]
+    self.conv_state.assign(conv_input.contiguous()).realize()
 
     y = Tensor.stack(*outputs, dim=2).transpose(1, 2).reshape(B, T, self.value_dim)
     z_r = z.reshape(B * T, self.num_v_heads, self.head_v_dim)
@@ -288,7 +296,7 @@ class GatedDeltaNetBlock:
 class TransformerBlock:
   def __init__(self, dim:int, hidden_dim:int, n_heads:int, n_kv_heads:int, norm_eps:float, head_dim:int, rope_theta:float,
                max_context:int=0, qk_norm:int=0, num_experts:int=0, num_experts_per_tok:int=0,
-               linear=nn.Linear, expert_weights_cls=None):
+               shared_hidden_dim:int=0, linear=nn.Linear, expert_weights_cls=None):
     self.n_heads      = n_heads
     self.n_kv_heads   = n_kv_heads
     self.head_dim     = head_dim
@@ -317,6 +325,11 @@ class TransformerBlock:
       self.ffn_gate_exps = _ew(num_experts, dim, hidden_dim)
       self.ffn_up_exps = _ew(num_experts, dim, hidden_dim)
       self.ffn_down_exps = _ew(num_experts, hidden_dim, dim)
+      if shared_hidden_dim > 0:
+        self.ffn_gate_shexp = linear(dim, shared_hidden_dim, bias=False)
+        self.ffn_up_shexp = linear(dim, shared_hidden_dim, bias=False)
+        self.ffn_down_shexp = linear(shared_hidden_dim, dim, bias=False)
+        self.ffn_gate_inp_shexp = Tensor.zeros(1)  # scalar sigmoid gate
     else:
       self.ffn_gate    = linear(dim, hidden_dim, bias=False)
       self.ffn_up      = linear(dim, hidden_dim, bias=False)
@@ -382,13 +395,13 @@ class TransformerBlock:
 
 class Transformer:
   def __init__(self, *, num_blocks, dim, hidden_dim, n_heads, n_kv_heads, norm_eps, vocab_size, head_dim:int, rope_theta:float,
-               max_context:int=0, qk_norm:int=0, num_experts:int=0, num_experts_per_tok:int=0,
+               max_context:int=0, qk_norm:int=0, num_experts:int=0, num_experts_per_tok:int=0, shared_hidden_dim:int=0,
                linear=nn.Linear, expert_weights_cls=None, blocks:list|None=None):
     if blocks is not None:
       self.blk = blocks  # pre-built blocks (for hybrid architectures)
     else:
       self.blk = [TransformerBlock(dim, hidden_dim, n_heads, n_kv_heads, norm_eps, head_dim, rope_theta, max_context, qk_norm,
-                                   num_experts, num_experts_per_tok, linear, expert_weights_cls) for _ in range(num_blocks)]
+                                   num_experts, num_experts_per_tok, shared_hidden_dim, linear, expert_weights_cls) for _ in range(num_blocks)]
     self.token_embd  = nn.Embedding(vocab_size, dim)
     self.output_norm = nn.RMSNorm(dim, norm_eps)
     self.output = linear(dim, vocab_size, bias=False)
@@ -431,6 +444,8 @@ class Transformer:
     norm_eps = kv[f'{arch}.attention.layer_norm_rms_epsilon']
     num_experts = kv.get(f'{arch}.expert_count', 0)
     num_experts_per_tok = kv.get(f'{arch}.expert_used_count', 0)
+    # Shared expert hidden dim: feed_forward_length when expert_feed_forward_length is also present
+    shared_hidden_dim = kv.get(f'{arch}.feed_forward_length', 0) if kv.get(f'{arch}.expert_feed_forward_length') else 0
     head_dim = kv.get(f'{arch}.attention.key_length', dim // n_heads)
     rope_theta = kv[f'{arch}.rope.freq_base']
     qk_norm = int(state_dict['blk.0.attn_q_norm.weight'].shape[0]) if 'blk.0.attn_q_norm.weight' in state_dict else 0
@@ -490,11 +505,12 @@ class Transformer:
         if (i + 1) % full_attn_interval == 0:
           # Full attention block (every Nth layer)
           blocks.append(TransformerBlock(dim, hidden_dim, n_heads, n_kv_heads, norm_eps, head_dim, rope_theta,
-                                         max_context, qk_norm, num_experts, num_experts_per_tok, linear, expert_weights_cls))
+                                         max_context, qk_norm, num_experts, num_experts_per_tok, shared_hidden_dim,
+                                         linear, expert_weights_cls))
         else:
           # DeltaNet SSM block
           blocks.append(GatedDeltaNetBlock(dim, hidden_dim, norm_eps, num_experts=num_experts,
-                                           num_experts_per_tok=num_experts_per_tok,
+                                           num_experts_per_tok=num_experts_per_tok, shared_hidden_dim=shared_hidden_dim,
                                            linear=linear, expert_weights_cls=expert_weights_cls, **ssm_cfg))
       model = Transformer(num_blocks=num_blocks, dim=dim, hidden_dim=hidden_dim, n_heads=n_heads, n_kv_heads=n_kv_heads,
                           norm_eps=norm_eps, vocab_size=vocab_size, head_dim=head_dim, rope_theta=rope_theta,
@@ -504,7 +520,7 @@ class Transformer:
       model = Transformer(num_blocks=num_blocks, dim=dim, hidden_dim=hidden_dim, n_heads=n_heads, n_kv_heads=n_kv_heads,
                           norm_eps=norm_eps, vocab_size=vocab_size, head_dim=head_dim, rope_theta=rope_theta,
                           max_context=max_context, qk_norm=qk_norm, num_experts=num_experts, num_experts_per_tok=num_experts_per_tok,
-                          linear=linear, expert_weights_cls=expert_weights_cls)
+                          shared_hidden_dim=shared_hidden_dim, linear=linear, expert_weights_cls=expert_weights_cls)
     # Remap GGUF tensor names for hybrid models
     if is_hybrid:
       remap = {}
