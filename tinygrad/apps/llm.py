@@ -492,8 +492,11 @@ class Transformer:
             state_dict[name] = dequant_q4_0_blocks(state_dict[name], *reversed(dims))
 
     # Cast non-Q4_0 tensors to float16
+    # NOTE: .contiguous() before .cast() forces a buffer boundary so disk-backed F32 tensors (e.g. ssm_a, norms)
+    # get copied to device before the dtype cast, avoiding an unrenderable DISK→BITCAST→CAST→COPY chain on Metal
     if getenv("HALF", 1):
-      state_dict = {k: v.cast('float16') if v.dtype != dtypes.uint8 else v for k, v in state_dict.items()}
+      state_dict = {k: v.contiguous().cast('float16') if v.dtype not in (dtypes.uint8, dtypes.float16) else v
+                    for k, v in state_dict.items()}
 
     # Permute Q/K weights from interleaved to half-split RoPE layout (llama-style models only)
     if arch == 'llama':
