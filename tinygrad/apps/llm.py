@@ -109,7 +109,7 @@ class GatedDeltaNetBlock:
     # SSM parameters
     self.ssm_a = Tensor.zeros(num_v_heads)                   # -exp(A_log), stored post-negation in GGUF
     self.ssm_dt = Tensor.zeros(num_v_heads)                  # dt_bias (stored as ssm_dt.bias in GGUF)
-    self.ssm_conv1d = Tensor.zeros(d_conv, conv_dim)         # depthwise conv kernel
+    self.ssm_conv1d = Tensor.zeros(conv_dim, d_conv)         # depthwise conv kernel
     self.ssm_norm = nn.RMSNorm(head_v_dim, norm_eps)         # gated output norm
     self.ssm_out = linear(value_dim, dim, bias=False)        # output projection
 
@@ -159,7 +159,7 @@ class GatedDeltaNetBlock:
     new_state = self.conv_state[:, :, 1:].cat(xBC.unsqueeze(-1), dim=-1)
     assigned = self.conv_state.uop.after(self.conv_state.uop.assign(new_state.contiguous().uop))
     state = Tensor(assigned, device=assigned.device)
-    x = (state * self.ssm_conv1d.T.unsqueeze(0)).sum(-1)
+    x = (state * self.ssm_conv1d.unsqueeze(0)).sum(-1)
     return x.silu()
 
   def _conv1d_prefill(self, xBC:Tensor) -> Tensor:
@@ -171,7 +171,7 @@ class GatedDeltaNetBlock:
     out_cols = []
     for t in range(T):
       window = x_padded[:, :, t:t+self.d_conv]
-      out_cols.append((window * self.ssm_conv1d.T.unsqueeze(0)).sum(-1))
+      out_cols.append((window * self.ssm_conv1d.unsqueeze(0)).sum(-1))
     out = Tensor.stack(*out_cols, dim=-1)  # (B, C, T)
     return out.permute(0, 2, 1).silu()
 
