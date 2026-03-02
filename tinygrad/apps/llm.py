@@ -113,9 +113,8 @@ class GatedDeltaNetBlock:
     self.ssm_norm = nn.RMSNorm(head_v_dim, norm_eps)         # gated output norm
     self.ssm_out = linear(value_dim, dim, bias=False)        # output projection
 
-    # Norms
+    # Norms: attn_norm = pre-SSM, post_attention_norm = pre-FFN (no separate ffn_norm in Qwen3.5)
     self.attn_norm = nn.RMSNorm(dim, norm_eps)
-    self.ffn_norm = nn.RMSNorm(dim, norm_eps)
     self.post_attention_norm = nn.RMSNorm(dim, norm_eps)
 
     # MoE FFN (shared between SSM and attention blocks)
@@ -226,8 +225,7 @@ class GatedDeltaNetBlock:
     z_r = z.reshape(B * T, self.num_v_heads, self.head_v_dim)
     y_r = y.reshape(B * T, self.num_v_heads, self.head_v_dim)
     y_normed = (self.ssm_norm(y_r) * z_r.silu()).reshape(B, T, self.value_dim)
-    out = self.ssm_out(y_normed)
-    return x + self.post_attention_norm(out)
+    return x + self.ssm_out(y_normed)
 
   @function
   def _deltanet_step(self, x:Tensor, start_pos:int|UOp) -> Tensor:
@@ -261,12 +259,11 @@ class GatedDeltaNetBlock:
     z_r = z.reshape(B, self.num_v_heads, self.head_v_dim)
     y_r = y.reshape(B, self.num_v_heads, self.head_v_dim)
     y_normed = (self.ssm_norm(y_r) * z_r.silu()).reshape(B, 1, self.value_dim)
-    out = self.ssm_out(y_normed)
-    return x + self.post_attention_norm(out)
+    return x + self.ssm_out(y_normed)
 
   @function
   def _feed_forward(self, h:Tensor) -> Tensor:
-    h_norm = self.ffn_norm(h)
+    h_norm = self.post_attention_norm(h)
     if hasattr(self, 'ffn_gate_exps'):
       x = h_norm.unsqueeze(2)
       probs, sel = self.ffn_gate_inp(h_norm).softmax(-1).topk(self.num_experts_per_tok)
