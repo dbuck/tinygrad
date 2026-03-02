@@ -492,13 +492,19 @@ class Transformer:
             state_dict[name] = dequant_q4_0_blocks(state_dict[name], *reversed(dims))
 
     # Cast non-Q4_0 tensors to float16
-    # NOTE: native GGUF types (F32/F16) are disk-backed bitcasts — skip the cast to avoid
-    # an unrenderable DISK→BITCAST→CAST→COPY fusion issue in the scheduler.
-    # These are small tensors (norms, ssm_a, ssm_dt, routing weights) so the f32 overhead is negligible.
+    # Native GGUF types (F32/F16) are disk-backed bitcasts — keep as f32. These are small tensors
+    # (norms, ssm_a, ssm_dt, routing weights) so the memory overhead is negligible.
+    # Dequanted tensors (Q4_0/Q4_1 → f32) also reference disk. The scheduler fuses
+    # DISK→dequant→CAST(f32→f16)→COPY into one op that no renderer can handle.
+    # Fix: realize f32 on device first (breaks the disk chain), then cast to f16.
+    # Process one tensor at a time so peak memory is only one extra f32 buffer.
     if getenv("HALF", 1):
       native_ggml = {k for k in state_dict if tensor_info.get(k, (None,))[0] in (0, 1)}
-      state_dict = {k: v if v.dtype in (dtypes.uint8, dtypes.float16) or k in native_ggml
-                    else v.cast('float16') for k, v in state_dict.items()}
+      for k in list(state_dict.keys()):
+        v = state_dict[k]
+        if v.dtype in (dtypes.uint8, dtypes.float16) or k in native_ggml: continue
+        v.realize()
+        state_dict[k] = v.cast('float16').contiguous().realize()
 
     # Permute Q/K weights from interleaved to half-split RoPE layout (llama-style models only)
     if arch == 'llama':
