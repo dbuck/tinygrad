@@ -312,7 +312,9 @@ class TransformerBlock:
 
     # --- RMSNorms --------------------------------------------------------
     self.attn_norm   = nn.RMSNorm(dim, norm_eps)
-    self.ffn_norm    = nn.RMSNorm(dim, norm_eps)
+    # Qwen3.5 GGUF uses post_attention_norm, llama uses ffn_norm
+    if gated_attn: self.post_attention_norm = nn.RMSNorm(dim, norm_eps)
+    else: self.ffn_norm = nn.RMSNorm(dim, norm_eps)
     if qk_norm: self.attn_q_norm, self.attn_k_norm = nn.RMSNorm(qk_norm, norm_eps), nn.RMSNorm(qk_norm, norm_eps)
 
     # --- feed-forward (MoE or dense) -------------------------------------
@@ -377,7 +379,7 @@ class TransformerBlock:
 
   @function
   def _feed_forward(self, h: Tensor) -> Tensor:
-    h_norm = self.ffn_norm(h)
+    h_norm = (self.post_attention_norm if self.gated_attn else self.ffn_norm)(h)
     if hasattr(self, 'ffn_gate_exps'):
       x = h_norm.unsqueeze(2)  # (B, T, 1, D) - add expert dim for broadcasting
       probs, sel = self.ffn_gate_inp(h_norm).softmax(-1).topk(self.num_experts_per_tok)  # (B, T, k) each
