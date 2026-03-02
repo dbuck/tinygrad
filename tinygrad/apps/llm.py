@@ -1,6 +1,6 @@
 from __future__ import annotations
 import sys, argparse, typing, re, unicodedata, json, uuid, time, functools
-from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function
+from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes
 from tinygrad.helpers import partition, DEBUG, Timing, GlobalCounters, stderr_log, colored
 from tinygrad.viz.serve import TCPServerWithReuse, HTTPRequestHandler
 
@@ -83,7 +83,8 @@ def apply_rope(x:Tensor, freqs_cis:Tensor) -> Tensor:
 
 class TransformerBlock:
   def __init__(self, dim:int, hidden_dim:int, n_heads:int, n_kv_heads:int, norm_eps:float, head_dim:int, rope_theta:float,
-               max_context:int=0, qk_norm:int=0, num_experts:int=0, num_experts_per_tok:int=0):
+               max_context:int=0, qk_norm:int=0, num_experts:int=0, num_experts_per_tok:int=0,
+               linear=nn.Linear, expert_weights_cls=None):
     self.n_heads      = n_heads
     self.n_kv_heads   = n_kv_heads
     self.head_dim     = head_dim
@@ -94,10 +95,10 @@ class TransformerBlock:
     # --- attention projections (all linear, bias-free) ------------------
     q_proj_out       = self.head_dim * n_heads
     kv_proj_out      = self.head_dim * n_kv_heads
-    self.attn_q      = nn.Linear(dim, q_proj_out,  bias=False)
-    self.attn_k      = nn.Linear(dim, kv_proj_out, bias=False)
-    self.attn_v      = nn.Linear(dim, kv_proj_out, bias=False)
-    self.attn_output = nn.Linear(q_proj_out, dim,  bias=False)
+    self.attn_q      = linear(dim, q_proj_out,  bias=False)
+    self.attn_k      = linear(dim, kv_proj_out, bias=False)
+    self.attn_v      = linear(dim, kv_proj_out, bias=False)
+    self.attn_output = linear(q_proj_out, dim,  bias=False)
 
     # --- RMSNorms --------------------------------------------------------
     self.attn_norm   = nn.RMSNorm(dim, norm_eps)
@@ -106,15 +107,16 @@ class TransformerBlock:
 
     # --- feed-forward (MoE or dense) -------------------------------------
     if num_experts > 0:
+      _ew = expert_weights_cls if expert_weights_cls is not None else ExpertWeights
       self.num_experts_per_tok = num_experts_per_tok
-      self.ffn_gate_inp = nn.Linear(dim, num_experts, bias=False)  # router
-      self.ffn_gate_exps = ExpertWeights(num_experts, dim, hidden_dim)
-      self.ffn_up_exps = ExpertWeights(num_experts, dim, hidden_dim)
-      self.ffn_down_exps = ExpertWeights(num_experts, hidden_dim, dim)
+      self.ffn_gate_inp = nn.Linear(dim, num_experts, bias=False)  # router always dense
+      self.ffn_gate_exps = _ew(num_experts, dim, hidden_dim)
+      self.ffn_up_exps = _ew(num_experts, dim, hidden_dim)
+      self.ffn_down_exps = _ew(num_experts, hidden_dim, dim)
     else:
-      self.ffn_gate    = nn.Linear(dim, hidden_dim, bias=False)
-      self.ffn_up      = nn.Linear(dim, hidden_dim, bias=False)
-      self.ffn_down    = nn.Linear(hidden_dim, dim, bias=False)
+      self.ffn_gate    = linear(dim, hidden_dim, bias=False)
+      self.ffn_up      = linear(dim, hidden_dim, bias=False)
+      self.ffn_down    = linear(hidden_dim, dim, bias=False)
 
   @function
   def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor:
@@ -169,12 +171,13 @@ class TransformerBlock:
 
 class Transformer:
   def __init__(self, *, num_blocks, dim, hidden_dim, n_heads, n_kv_heads, norm_eps, vocab_size, head_dim:int, rope_theta:float,
-               max_context:int=0, qk_norm:int=0, num_experts:int=0, num_experts_per_tok:int=0):
+               max_context:int=0, qk_norm:int=0, num_experts:int=0, num_experts_per_tok:int=0,
+               linear=nn.Linear, expert_weights_cls=None):
     self.blk = [TransformerBlock(dim, hidden_dim, n_heads, n_kv_heads, norm_eps, head_dim, rope_theta, max_context, qk_norm,
-                                 num_experts, num_experts_per_tok) for _ in range(num_blocks)]
+                                 num_experts, num_experts_per_tok, linear, expert_weights_cls) for _ in range(num_blocks)]
     self.token_embd  = nn.Embedding(vocab_size, dim)
     self.output_norm = nn.RMSNorm(dim, norm_eps)
-    self.output = nn.Linear(dim, vocab_size, bias=False)
+    self.output = linear(dim, vocab_size, bias=False)
     self.max_context = max_context
     # JIT is used if T=1 and start_pos is a UOp. TODO: make this not needed by including T in the JIT and making start_pos always a UOp
     self.forward_jit = TinyJit(self.forward)
@@ -190,33 +193,72 @@ class Transformer:
 
   @staticmethod
   def from_gguf(gguf:Tensor, max_context:int|None=None, realize=bool(getenv("REALIZE", 1))) -> tuple[Transformer, dict]:
-    # TODO: remove the need for copy to default device
-    kv, state_dict = nn.state.gguf_load(gguf.to(None))
+    # Try Q4_0-aware loader for memory-efficient loading of quantized models
+    try:
+      from q4_0_linear import Q4_0Linear, Q4_0ExpertWeights, gguf_load_q4_0, dequant_q4_0_blocks, tensor_to_q4_0_blocks
+      kv, state_dict, tensor_info = gguf_load_q4_0(gguf.to(None))
+      has_q4_0 = any(t[0] == 2 for t in tensor_info.values())
+    except ImportError:
+      kv, state_dict = nn.state.gguf_load(gguf.to(None))
+      has_q4_0, tensor_info = False, {}
 
-    # all state items should be float16, not float32
-    state_dict = {k:v.cast('float16') if getenv("HALF", 1) else v for k,v in state_dict.items()}
-
-    # some models like Llama 3.2 don't have an output.weight, they just tie to the token_embd.weight
-    if 'output.weight' not in state_dict: state_dict['output.weight'] = state_dict['token_embd.weight']
+    if has_q4_0:
+      linear, expert_weights_cls = Q4_0Linear, Q4_0ExpertWeights
+    else:
+      linear, expert_weights_cls = nn.Linear, None
 
     arch = kv['general.architecture']
     max_context = min(max_context, kv[f'{arch}.context_length']) if max_context is not None else kv[f'{arch}.context_length']
     n_heads, n_kv_heads = kv[f'{arch}.attention.head_count'], kv[f'{arch}.attention.head_count_kv']
+    vocab_size = len(kv['tokenizer.ggml.tokens'])
+    dim = kv[f'{arch}.embedding_length']
+
+    # Handle tied output weight
+    if 'output.weight' not in state_dict:
+      if has_q4_0:
+        if tensor_info.get('token_embd.weight', (None,))[0] == 2:
+          # token_embd is Q4_0 blocks — copy for output, dequant for nn.Embedding
+          state_dict['output.weight'] = state_dict['token_embd.weight']
+          state_dict['token_embd.weight'] = dequant_q4_0_blocks(state_dict['token_embd.weight'], vocab_size, dim)
+        else:
+          # token_embd is float — quantize for Q4_0Linear output
+          state_dict['output.weight'] = tensor_to_q4_0_blocks(state_dict['token_embd.weight'])
+      else:
+        state_dict['output.weight'] = state_dict['token_embd.weight']
+
+    # Dequant Q4_0 blocks for layers that must stay dense (router, norms, embeddings)
+    _q4_0_layer_keys = ('attn_q.', 'attn_k.', 'attn_v.', 'attn_output.',
+                        'ffn_gate.', 'ffn_up.', 'ffn_down.', 'ffn_gate_exps.', 'ffn_up_exps.', 'ffn_down_exps.')
+    if has_q4_0:
+      for name in list(state_dict.keys()):
+        if name == 'token_embd.weight': continue  # handled above
+        info = tensor_info.get(name)
+        if info and info[0] == 2:
+          is_quantized_layer = any(k in name for k in _q4_0_layer_keys) or name == 'output.weight'
+          if not is_quantized_layer:
+            _, dims = info
+            state_dict[name] = dequant_q4_0_blocks(state_dict[name], *reversed(dims))
+
+    # Cast non-Q4_0 tensors to float16
+    if getenv("HALF", 1):
+      state_dict = {k: v.cast('float16') if v.dtype != dtypes.uint8 else v for k, v in state_dict.items()}
 
     # Permute Q/K weights from interleaved to half-split RoPE layout (llama-style models only)
     if arch == 'llama':
-      for name in state_dict:
+      for name in list(state_dict.keys()):
+        if has_q4_0 and state_dict[name].dtype == dtypes.uint8: continue  # can't rearrange compressed Q4_0 blocks
         if 'attn_q.weight' in name: state_dict[name] = state_dict[name].rearrange("(n h two) d -> (n two h) d", n=n_heads, two=2)
         if 'attn_k.weight' in name: state_dict[name] = state_dict[name].rearrange("(n h two) d -> (n two h) d", n=n_kv_heads, two=2)
 
-    model = Transformer(num_blocks=kv[f'{arch}.block_count'], dim=kv[f'{arch}.embedding_length'],
+    model = Transformer(num_blocks=kv[f'{arch}.block_count'], dim=dim,
                         hidden_dim=kv.get(f'{arch}.expert_feed_forward_length', kv[f'{arch}.feed_forward_length']),
                         n_heads=n_heads, n_kv_heads=n_kv_heads, norm_eps=kv[f'{arch}.attention.layer_norm_rms_epsilon'],
-                        vocab_size=len(kv['tokenizer.ggml.tokens']),
-                        head_dim=kv.get(f'{arch}.attention.key_length', kv[f'{arch}.embedding_length'] // n_heads),
+                        vocab_size=vocab_size,
+                        head_dim=kv.get(f'{arch}.attention.key_length', dim // n_heads),
                         rope_theta=kv[f'{arch}.rope.freq_base'], max_context=max_context,
                         qk_norm=int(state_dict['blk.0.attn_q_norm.weight'].shape[0]) if 'blk.0.attn_q_norm.weight' in state_dict else 0,
-                        num_experts=kv.get(f'{arch}.expert_count', 0), num_experts_per_tok=kv.get(f'{arch}.expert_used_count', 0))
+                        num_experts=kv.get(f'{arch}.expert_count', 0), num_experts_per_tok=kv.get(f'{arch}.expert_used_count', 0),
+                        linear=linear, expert_weights_cls=expert_weights_cls)
     nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
     if realize:
@@ -337,14 +379,20 @@ class Handler(HTTPRequestHandler):
 
 if __name__ == "__main__":
   parser = argparse.ArgumentParser()
-  parser.add_argument("--model", "-m", choices=list(models.keys()), default=list(models.keys())[0], help="Model choice")
+  parser.add_argument("--model", "-m", default=list(models.keys())[0], help="Model name or path to GGUF file")
   parser.add_argument("--max_context", type=int, default=4096, help="Max Context Length")
   parser.add_argument("--serve", nargs='?', type=int, const=11434, metavar="PORT", help="Run OpenAI compatible API (optional port, default 11434)")
   parser.add_argument("--benchmark", nargs='?', type=int, const=20, metavar="COUNT", help="Benchmark tok/s (optional count, default 20)")
   args = parser.parse_args()
 
   # load the model
-  raw_model = Tensor.from_url(models[args.model])
+  import pathlib, os
+  if args.model in models:
+    raw_model = Tensor.from_url(models[args.model])
+  elif os.path.exists(args.model):
+    raw_model = Tensor(pathlib.Path(args.model))
+  else:
+    parser.error(f"Unknown model '{args.model}'. Available: {', '.join(models.keys())}, or pass a path to a GGUF file.")
   model, kv = Transformer.from_gguf(raw_model, args.max_context)
   if DEBUG >= 1 or args.benchmark:
     print(f"using model {args.model} with {raw_model.nbytes():,} bytes and {sum(x.numel() for x in nn.state.get_parameters(model)):,} params")

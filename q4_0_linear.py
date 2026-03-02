@@ -118,13 +118,70 @@ class Q4_0Linear:
     return new_tensors
 
 
-def gguf_load_q4_0(tensor: Tensor) -> tuple[dict, dict[str, Tensor]]:
+def dequant_q4_0_blocks(blocks: Tensor, *shape) -> Tensor:
+  """Dequant Q4_0 blocks (n_blocks, 18) uint8 to float32 tensor with given shape."""
+  scales = blocks[:, :2].bitcast(dtypes.float16).cast(dtypes.float32)
+  qbytes = blocks[:, 2:]
+  low = qbytes.bitwise_and(0x0F)
+  high = qbytes.rshift(4)
+  nibbles = low.cat(high, dim=-1)
+  w = (nibbles.cast(dtypes.float32) - 8.0) * scales
+  return w.reshape(*shape)
+
+def tensor_to_q4_0_blocks(t: Tensor) -> Tensor:
+  """Convert a float tensor to Q4_0 blocks (n_blocks, 18) uint8."""
+  flat = t.cast(dtypes.float32).flatten()
+  assert flat.shape[0] % 32 == 0
+  blocks = flat.reshape(-1, 32)
+  amax = blocks.abs().max(axis=-1, keepdim=True)
+  d = amax / 8.0
+  safe_d = d + (d == 0.0).cast(dtypes.float32) * 1e-10
+  q = (blocks / safe_d + 8.0).round().clip(0, 15).cast(dtypes.uint8)
+  lo = q[:, :16]
+  hi = q[:, 16:]
+  packed = lo.bitwise_or(hi.lshift(4))
+  d_bytes = d.cast(dtypes.float16).bitcast(dtypes.uint8)
+  return d_bytes.cat(packed, dim=-1)
+
+class Q4_0ExpertWeights:
+  """Drop-in replacement for ExpertWeights storing weights in Q4_0 format.
+
+  Weight shape: (total_blocks, 18) uint8 where total_blocks = (num_experts * out_features * in_features) / 32.
+  Dequantization happens lazily after gathering selected experts, so only active experts are dequanted.
+  """
+  def __init__(self, num_experts: int, in_features: int, out_features: int):
+    assert (in_features * out_features) % 32 == 0
+    n_blocks = (num_experts * in_features * out_features) // 32
+    self.weight = Tensor.zeros(n_blocks, 18, dtype=dtypes.uint8)
+    self.num_experts = num_experts
+    self.in_features = in_features
+    self.out_features = out_features
+
+  def __call__(self, sel: Tensor, x: Tensor) -> Tensor:
+    # sel: (B, T, k), x: (B, T, 1, in) or (B, T, k, in) -> output: (B, T, k, out)
+    blocks_per_expert = (self.in_features * self.out_features) // 32
+    w3d = self.weight.reshape(self.num_experts, blocks_per_expert, 18)
+    expert_blocks = w3d[sel]  # (B, T, k, blocks_per_expert, 18)
+
+    # Dequant selected experts only
+    scales = expert_blocks[..., :2].bitcast(dtypes.float16).cast(dtypes.float32)
+    qbytes = expert_blocks[..., 2:]
+    low = qbytes.bitwise_and(0x0F)
+    high = qbytes.rshift(4)
+    nibbles = low.cat(high, dim=-1)
+    w = (nibbles.cast(dtypes.float32) - 8.0) * scales  # (B, T, k, blocks_per_expert, 32)
+    w = w.reshape(*sel.shape, self.out_features, self.in_features)
+
+    return (x.unsqueeze(-2) @ w.transpose(-1, -2)).squeeze(-2)
+
+
+def gguf_load_q4_0(tensor: Tensor) -> tuple[dict, dict[str, Tensor], dict[str, tuple]]:
   """GGUF loader that keeps Q4_0 tensors as raw (n_blocks, 18) uint8 blocks.
 
   Other tensor types are dequanted normally via ggml_data_to_tensor.
-  Returns (kv_data, state_dict) just like tinygrad's gguf_load.
+  Returns (kv_data, state_dict, tensor_info) where tensor_info maps name -> (ggml_type, dims).
   """
-  reader, kv_data, state_dict = io.BufferedReader(TensorIO(tensor), 1_000_000), {}, {}
+  reader, kv_data, state_dict, tensor_info = io.BufferedReader(TensorIO(tensor), 1_000_000), {}, {}, {}
   def read_unpack(fmt: str, n: int): return struct.unpack(fmt, reader.read(n))[0]
   def read_str(): return str(reader.read(read_uint64()), "utf-8")
   def read_arr():
@@ -147,10 +204,11 @@ def gguf_load_q4_0(tensor: Tensor) -> tuple[dict, dict[str, Tensor]]:
 
   for name, dims, typ, off in t_infos:
     n_elements = prod(dims)
+    tensor_info[name] = (typ, dims)
     if typ == 2:  # Q4_0: keep as raw blocks instead of dequanting
       n_blocks = n_elements // 32
       state_dict[name] = tensor[data_start + off : data_start + off + n_blocks * 18].reshape(n_blocks, 18)
     else:
       state_dict[name] = ggml_data_to_tensor(tensor[data_start + off:], n_elements, typ).reshape(*reversed(dims))
 
-  return kv_data, state_dict
+  return kv_data, state_dict, tensor_info
