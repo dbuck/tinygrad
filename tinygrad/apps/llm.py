@@ -306,8 +306,8 @@ class TransformerBlock:
     q_proj_out       = self.head_dim * n_heads
     kv_proj_out      = self.head_dim * n_kv_heads
     self.attn_q      = linear(dim, q_proj_out * (2 if gated_attn else 1),  bias=False)
-    self.attn_k      = linear(dim, kv_proj_out, bias=False)
-    self.attn_v      = linear(dim, kv_proj_out, bias=False)
+    self.attn_k      = nn.Linear(dim, kv_proj_out, bias=False)  # K/V are small, always dense (often Q8_0 not Q4_0)
+    self.attn_v      = nn.Linear(dim, kv_proj_out, bias=False)
     self.attn_output = linear(q_proj_out, dim,  bias=False)
 
     # --- RMSNorms --------------------------------------------------------
@@ -473,7 +473,7 @@ class Transformer:
     full_attn_interval = kv.get(f'{arch}.full_attention_interval', 0)
 
     # Dequant Q4_0 blocks for layers that must stay dense
-    _q4_0_layer_keys = ('attn_q.', 'attn_k.', 'attn_v.', 'attn_output.', 'attn_qkv.', 'attn_gate.',
+    _q4_0_layer_keys = ('attn_q.', 'attn_output.', 'attn_qkv.', 'attn_gate.',
                         'ssm_alpha.', 'ssm_beta.', 'ssm_out.',
                         'ffn_gate.', 'ffn_up.', 'ffn_down.',
                         'ffn_gate_shexp.', 'ffn_up_shexp.', 'ffn_down_shexp.')
