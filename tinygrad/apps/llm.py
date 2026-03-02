@@ -439,7 +439,7 @@ class Transformer:
       has_q4_0, tensor_info = False, {}
 
     if has_q4_0:
-      linear, expert_weights_cls = Q4_0Linear, None  # expert weights may be mixed types (Q4_0/Q4_1), always use ExpertWeights
+      linear, expert_weights_cls = Q4_0Linear, Q4_0ExpertWeights  # expert weights stored as Q4_0 raw blocks, dequant only selected experts
     else:
       linear, expert_weights_cls = nn.Linear, None
 
@@ -477,7 +477,7 @@ class Transformer:
     full_attn_interval = kv.get(f'{arch}.full_attention_interval', 0)
 
     # Dequant Q4_0 blocks for layers that must stay dense
-    _q4_0_layer_keys = ('attn_q.', 'attn_output.', 'attn_qkv.', 'attn_gate.',
+    _q4_0_layer_keys = ('attn_q.', 'attn_output.', 'attn_qkv.', 'attn_gate.', 'ffn_gate_exps.', 'ffn_up_exps.', 'ffn_down_exps.',
                         'ssm_alpha.', 'ssm_beta.', 'ssm_out.',
                         'ffn_gate.', 'ffn_up.', 'ffn_down.',
                         'ffn_gate_shexp.', 'ffn_up_shexp.', 'ffn_down_shexp.')
@@ -488,8 +488,10 @@ class Transformer:
         if info and info[0] == 2:
           is_quantized_layer = any(k in name for k in _q4_0_layer_keys)
           if not is_quantized_layer:
-            _, dims = info
-            state_dict[name] = dequant_q4_0_blocks(state_dict[name], *reversed(dims))
+            # Skip if already dequanted by numpy path (dtype won't be uint8)
+            if state_dict[name].dtype == dtypes.uint8:
+              _, dims = info
+              state_dict[name] = dequant_q4_0_blocks(state_dict[name], *reversed(dims))
 
     # Cast non-Q4_0 tensors to float16
     # Native GGUF types (F32/F16) are disk-backed bitcasts — keep as f32. These are small tensors
@@ -499,12 +501,10 @@ class Transformer:
     # Fix: realize f32 on device first (breaks the disk chain), then cast to f16.
     # Process one tensor at a time so peak memory is only one extra f32 buffer.
     if getenv("HALF", 1):
-      native_ggml = {k for k in state_dict if tensor_info.get(k, (None,))[0] in (0, 1)}
       for k in list(state_dict.keys()):
         v = state_dict[k]
-        if v.dtype in (dtypes.uint8, dtypes.float16) or k in native_ggml: continue
-        v.realize()
-        state_dict[k] = v.cast('float16').contiguous().realize()
+        if v.dtype in (dtypes.uint8, dtypes.float16): continue
+        state_dict[k] = v.half()
 
     # Permute Q/K weights from interleaved to half-split RoPE layout (llama-style models only)
     if arch == 'llama':

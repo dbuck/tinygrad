@@ -175,6 +175,98 @@ class Q4_0ExpertWeights:
     return (x.unsqueeze(-2) @ w.transpose(-1, -2)).squeeze(-2)
 
 
+def _numpy_ggml_dequant(mm, offset: int, n_elements: int, ggml_type: int):
+  """Dequant GGML tensor data in pure numpy. Returns float32 ndarray."""
+  import numpy as np
+
+  # Native types
+  if ggml_type == 0:  # F32
+    return np.frombuffer(mm, dtype=np.float32, count=n_elements, offset=offset).copy()
+  if ggml_type == 1:  # F16
+    return np.frombuffer(mm, dtype=np.float16, count=n_elements, offset=offset).astype(np.float32)
+
+  # Quantized types
+  if ggml_type == 2:  # Q4_0: 32 elements per 18-byte block
+    n_blocks = n_elements // 32
+    raw = np.frombuffer(mm, dtype=np.uint8, count=n_blocks * 18, offset=offset).reshape(n_blocks, 18)
+    d = raw[:, :2].view(np.float16).astype(np.float32)  # (n_blocks, 1)
+    qbytes = raw[:, 2:]  # (n_blocks, 16)
+    lo = (qbytes & 0x0F).astype(np.int8)
+    hi = (qbytes >> 4).astype(np.int8)
+    quants = np.concatenate([lo, hi], axis=-1).astype(np.float32) - 8.0  # (n_blocks, 32)
+    return (quants * d).flatten()
+
+  if ggml_type == 3:  # Q4_1: 32 elements per 20-byte block
+    n_blocks = n_elements // 32
+    raw = np.frombuffer(mm, dtype=np.uint8, count=n_blocks * 20, offset=offset).reshape(n_blocks, 20)
+    d = raw[:, :2].view(np.float16).astype(np.float32)  # (n_blocks, 1)
+    m = raw[:, 2:4].view(np.float16).astype(np.float32)  # (n_blocks, 1)
+    qbytes = raw[:, 4:]  # (n_blocks, 16)
+    lo = (qbytes & 0x0F).astype(np.float32)
+    hi = (qbytes >> 4).astype(np.float32)
+    quants = np.concatenate([lo, hi], axis=-1)  # (n_blocks, 32)
+    return (quants * d + m).flatten()
+
+  if ggml_type == 8:  # Q8_0: 32 elements per 34-byte block
+    n_blocks = n_elements // 32
+    raw = np.frombuffer(mm, dtype=np.uint8, count=n_blocks * 34, offset=offset).reshape(n_blocks, 34)
+    d = raw[:, :2].view(np.float16).astype(np.float32)  # (n_blocks, 1)
+    qs = raw[:, 2:].view(np.int8).astype(np.float32)  # (n_blocks, 32)
+    return (d * qs).flatten()
+
+  if ggml_type == 14:  # Q6_K: 256 elements per 210-byte block
+    n_blocks = n_elements // 256
+    raw = np.frombuffer(mm, dtype=np.uint8, count=n_blocks * 210, offset=offset).reshape(n_blocks, 210)
+    ql = raw[:, :128].reshape(n_blocks, 2, 64)  # low 4 bits
+    qh = raw[:, 128:192].reshape(n_blocks, 2, 32)  # high 2 bits
+    scales = raw[:, 192:208].view(np.int8).astype(np.float32)  # (n_blocks, 16)
+    d = raw[:, 208:210].view(np.float16).astype(np.float32)  # (n_blocks, 1)
+    # Unpack: 4-bit low nibbles
+    xl_lo = (ql & 0x0F).astype(np.uint8)
+    xl_hi = (ql >> 4).astype(np.uint8)
+    xl = np.stack([xl_lo, xl_hi], axis=2).reshape(n_blocks, 4, 64).reshape(n_blocks, 256)
+    # Unpack: 2-bit high parts
+    xh_0 = (qh & 0x03).astype(np.uint8)
+    xh_1 = ((qh >> 2) & 0x03).astype(np.uint8)
+    xh_2 = ((qh >> 4) & 0x03).astype(np.uint8)
+    xh_3 = ((qh >> 6) & 0x03).astype(np.uint8)
+    xh = np.stack([xh_0, xh_1, xh_2, xh_3], axis=2).reshape(n_blocks, 256)
+    # Combine: 6-bit value = low4 | (high2 << 4), then subtract 32
+    q = (xl | (xh << 4)).astype(np.int8).astype(np.float32) - 32.0
+    # Scale: each group of 16 gets its own scale
+    scales_expanded = np.repeat(scales, 16, axis=-1)  # (n_blocks, 256)
+    return (d * q * scales_expanded).flatten()
+
+  raise ValueError(f"GGML type '{ggml_type}' is not supported in numpy dequant!")
+
+
+def _numpy_f32_to_q4_0(f32):
+  """Requantize f32 ndarray to Q4_0 blocks: (n_blocks, 18) uint8."""
+  import numpy as np
+  f32 = f32.flatten()
+  assert len(f32) % 32 == 0
+  blocks = f32.reshape(-1, 32)
+  n_blocks = blocks.shape[0]
+
+  # Per-block scale: d = amax / 8
+  amax = np.abs(blocks).max(axis=-1, keepdims=True)
+  d = amax / 8.0
+  safe_d = np.where(d == 0, 1e-10, d)
+
+  # Quantize: q = clamp(round(v / d + 8), 0, 15)
+  q = np.clip(np.round(blocks / safe_d + 8.0), 0, 15).astype(np.uint8)
+
+  # Pack nibbles: byte[j] = q[j] | (q[j+16] << 4)
+  lo = q[:, :16]
+  hi = q[:, 16:]
+  packed = (lo | (hi << 4)).astype(np.uint8)  # (n_blocks, 16)
+
+  # Assemble: [scale_fp16(2 bytes), packed(16 bytes)] = 18 bytes
+  d_bytes = d.astype(np.float16).view(np.uint8)  # (n_blocks, 2)
+  result = np.concatenate([d_bytes, packed], axis=-1)  # (n_blocks, 18)
+  return result
+
+
 def gguf_load_q4_0(tensor: Tensor) -> tuple[dict, dict[str, Tensor], dict[str, tuple]]:
   """GGUF loader that keeps Q4_0 tensors as raw (n_blocks, 18) uint8 blocks.
 
@@ -202,13 +294,52 @@ def gguf_load_q4_0(tensor: Tensor) -> tuple[dict, dict[str, Tensor], dict[str, t
   alignment, pos = kv_data.get("general.alignment", 32), reader.tell()
   data_start = round_up(pos, alignment)
 
+  # Layer name patterns where Q4_0 raw blocks should be kept (projection weights used in Q4_0Linear)
+  _q4_0_keep = {'attn_q.', 'attn_qkv.', 'attn_gate.', 'attn_output.', 'ssm_alpha.', 'ssm_beta.', 'ssm_out.'}
+
+  # Memory-map the GGUF file for direct numpy dequant (avoids tinygrad's lazy graph scheduler issues)
+  import numpy as np, mmap as _mmap
+  disk_path = None
+  for s in tensor.uop.toposort():
+    if s.op.name == 'DEVICE' and str(s.arg).startswith('DISK:'):
+      disk_path = str(s.arg)[5:]
+      break
+  assert disk_path is not None, "Could not find disk path from tensor UOp"
+  f = open(disk_path, 'rb')
+  mm = _mmap.mmap(f.fileno(), 0, access=_mmap.ACCESS_READ)
+
+  # Expert weight names that should stay as Q4_0 raw blocks for Q4_0ExpertWeights
+  _expert_keys = {'ffn_gate_exps.', 'ffn_up_exps.', 'ffn_down_exps.'}
+
   for name, dims, typ, off in t_infos:
     n_elements = prod(dims)
     tensor_info[name] = (typ, dims)
-    if typ == 2:  # Q4_0: keep as raw blocks instead of dequanting
+    is_q4_proj = typ == 2 and any(k in name for k in _q4_0_keep)
+    is_expert = any(k in name for k in _expert_keys)
+
+    if is_q4_proj:
+      # Keep Q4_0 projection weights as raw blocks for Q4_0Linear
       n_blocks = n_elements // 32
       state_dict[name] = tensor[data_start + off : data_start + off + n_blocks * 18].reshape(n_blocks, 18)
+    elif is_expert:
+      # Expert weights: keep as Q4_0 raw blocks for Q4_0ExpertWeights (dequant only selected experts at runtime)
+      # Q4_0 experts: read raw bytes directly
+      # Q4_1/other experts: dequant to f32 in numpy, then requant to Q4_0
+      n_blocks = n_elements // 32
+      if typ == 2:  # already Q4_0
+        raw = np.frombuffer(mm, dtype=np.uint8, count=n_blocks * 18, offset=data_start + off).copy()
+        state_dict[name] = Tensor(raw.reshape(n_blocks, 18))
+      else:
+        # Dequant to f32, then requant to Q4_0 blocks
+        f32 = _numpy_ggml_dequant(mm, data_start + off, n_elements, typ)
+        state_dict[name] = Tensor(_numpy_f32_to_q4_0(f32))
+        del f32
     else:
-      state_dict[name] = ggml_data_to_tensor(tensor[data_start + off:], n_elements, typ).reshape(*reversed(dims))
+      # Everything else: dequant in numpy, cast to fp16
+      arr = _numpy_ggml_dequant(mm, data_start + off, n_elements, typ).astype('float16')
+      state_dict[name] = Tensor(arr).reshape(*reversed(dims))
+      del arr
 
+  mm.close()
+  f.close()
   return kv_data, state_dict, tensor_info
