@@ -413,7 +413,7 @@ class Transformer:
                                    num_experts, num_experts_per_tok, shared_hidden_dim, linear, expert_weights_cls) for _ in range(num_blocks)]
     self.token_embd  = nn.Embedding(vocab_size, dim)
     self.output_norm = nn.RMSNorm(dim, norm_eps)
-    self.output = linear(dim, vocab_size, bias=False)
+    self.output = nn.Linear(dim, vocab_size, bias=False)  # lm_head is often Q6_K, not Q4_0
     self.max_context = max_context
     # JIT is used if T=1 and start_pos is a UOp. TODO: make this not needed by including T in the JIT and making start_pos always a UOp
     self.forward_jit = TinyJit(self.forward)
@@ -459,14 +459,12 @@ class Transformer:
     rope_theta = kv[f'{arch}.rope.freq_base']
     qk_norm = int(state_dict['blk.0.attn_q_norm.weight'].shape[0]) if 'blk.0.attn_q_norm.weight' in state_dict else 0
 
-    # Handle tied output weight
+    # Handle tied output weight — both embedding and output are dense (nn.Linear)
     if 'output.weight' not in state_dict:
-      if has_q4_0:
-        if tensor_info.get('token_embd.weight', (None,))[0] == 2:
-          state_dict['output.weight'] = state_dict['token_embd.weight']
-          state_dict['token_embd.weight'] = dequant_q4_0_blocks(state_dict['token_embd.weight'], vocab_size, dim)
-        else:
-          state_dict['output.weight'] = tensor_to_q4_0_blocks(state_dict['token_embd.weight'])
+      if has_q4_0 and tensor_info.get('token_embd.weight', (None,))[0] == 2:
+        dequanted = dequant_q4_0_blocks(state_dict['token_embd.weight'], vocab_size, dim)
+        state_dict['token_embd.weight'] = dequanted
+        state_dict['output.weight'] = dequanted
       else:
         state_dict['output.weight'] = state_dict['token_embd.weight']
 
@@ -488,7 +486,7 @@ class Transformer:
         if name == 'token_embd.weight': continue
         info = tensor_info.get(name)
         if info and info[0] == 2:
-          is_quantized_layer = any(k in name for k in _q4_0_layer_keys) or name == 'output.weight'
+          is_quantized_layer = any(k in name for k in _q4_0_layer_keys)
           if not is_quantized_layer:
             _, dims = info
             state_dict[name] = dequant_q4_0_blocks(state_dict[name], *reversed(dims))
