@@ -427,7 +427,7 @@ class Transformer:
       has_q4_0, tensor_info = False, {}
 
     if has_q4_0:
-      linear, expert_weights_cls = Q4_0Linear, Q4_0ExpertWeights
+      linear, expert_weights_cls = Q4_0Linear, None  # expert weights may be mixed types (Q4_0/Q4_1), always use ExpertWeights
     else:
       linear, expert_weights_cls = nn.Linear, None
 
@@ -465,7 +465,7 @@ class Transformer:
     # Dequant Q4_0 blocks for layers that must stay dense
     _q4_0_layer_keys = ('attn_q.', 'attn_k.', 'attn_v.', 'attn_output.', 'attn_qkv.', 'attn_gate.',
                         'ssm_alpha.', 'ssm_beta.', 'ssm_out.',
-                        'ffn_gate.', 'ffn_up.', 'ffn_down.', 'ffn_gate_exps.', 'ffn_up_exps.', 'ffn_down_exps.',
+                        'ffn_gate.', 'ffn_up.', 'ffn_down.',
                         'ffn_gate_shexp.', 'ffn_up_shexp.', 'ffn_down_shexp.')
     if has_q4_0:
       for name in list(state_dict.keys()):
