@@ -237,6 +237,32 @@ def _numpy_ggml_dequant(mm, offset: int, n_elements: int, ggml_type: int):
     scales_expanded = np.repeat(scales, 16, axis=-1)  # (n_blocks, 256)
     return (d * q * scales_expanded).flatten()
 
+  if ggml_type == 13:  # Q5_K: 256 elements per 176-byte block
+    n_blocks = n_elements // 256
+    raw = np.frombuffer(mm, dtype=np.uint8, count=n_blocks * 176, offset=offset).reshape(n_blocks, 176)
+    d = raw[:, :2].view(np.float16).astype(np.float32)  # (n_blocks, 1)
+    dmin = raw[:, 2:4].view(np.float16).astype(np.float32)  # (n_blocks, 1)
+    scales = raw[:, 4:16]  # (n_blocks, 12)
+    qh = raw[:, 16:48]  # (n_blocks, 32)
+    ql = raw[:, 48:]  # (n_blocks, 128)
+    # Unpack scales (Q4_K get_scale_min pattern)
+    scales = scales.reshape((n_blocks, 3, 4))
+    sd, sm, m_d = np.split(scales, 3, axis=-2)
+    sc = np.concatenate([sd & 0x3F, (m_d & 0x0F) | ((sd >> 2) & 0x30)], axis=-1).reshape((n_blocks, 8))
+    m = np.concatenate([sm & 0x3F, (m_d >> 4) | ((sm >> 2) & 0x30)], axis=-1).reshape((n_blocks, 8))
+    # Unpack 4-bit low nibbles
+    ql = ql.reshape((n_blocks, -1, 1, 32))
+    ql_unpacked = np.concatenate([(ql & 0x0F), (ql >> 4)], axis=2).reshape((n_blocks, -1, 32))
+    # Unpack 1-bit high parts
+    qh = qh.reshape((n_blocks, -1, 1, 32))
+    shifts = np.array(range(8), dtype=np.uint8).reshape((1, 1, 8, 1))
+    qh_unpacked = ((qh >> shifts) & 0x01).reshape((n_blocks, -1, 32))
+    # Combine: 5-bit = low4 | (high1 << 4)
+    q = (ql_unpacked | (qh_unpacked << 4)).astype(np.float32)
+    d_scaled = (d * sc.astype(np.float32)).reshape((n_blocks, 8, 1))
+    dm = (dmin * m.astype(np.float32)).reshape((n_blocks, 8, 1))
+    return (d_scaled * q - dm).reshape((n_blocks, 256)).flatten()
+
   raise ValueError(f"GGML type '{ggml_type}' is not supported in numpy dequant!")
 
 
@@ -295,7 +321,8 @@ def gguf_load_q4_0(tensor: Tensor) -> tuple[dict, dict[str, Tensor], dict[str, t
   data_start = round_up(pos, alignment)
 
   # Layer name patterns where Q4_0 raw blocks should be kept (projection weights used in Q4_0Linear)
-  _q4_0_keep = {'attn_q.', 'attn_qkv.', 'attn_gate.', 'attn_output.', 'ssm_alpha.', 'ssm_beta.', 'ssm_out.'}
+  _q4_0_keep = {'attn_q.', 'attn_qkv.', 'attn_gate.', 'attn_output.', 'ssm_alpha.', 'ssm_beta.', 'ssm_out.',
+                  'ffn_gate.', 'ffn_up.', 'ffn_down.', 'ffn_gate_shexp.', 'ffn_up_shexp.', 'ffn_down_shexp.'}
 
   # Memory-map the GGUF file for direct numpy dequant (avoids tinygrad's lazy graph scheduler issues)
   import numpy as np, mmap as _mmap
@@ -314,13 +341,18 @@ def gguf_load_q4_0(tensor: Tensor) -> tuple[dict, dict[str, Tensor], dict[str, t
   for name, dims, typ, off in t_infos:
     n_elements = prod(dims)
     tensor_info[name] = (typ, dims)
-    is_q4_proj = typ == 2 and any(k in name for k in _q4_0_keep)
+    is_q4_proj = any(k in name for k in _q4_0_keep)
     is_expert = any(k in name for k in _expert_keys)
 
     if is_q4_proj:
-      # Keep Q4_0 projection weights as raw blocks for Q4_0Linear
+      # Keep/requant projection weights as Q4_0 raw blocks for Q4_0Linear
       n_blocks = n_elements // 32
-      state_dict[name] = tensor[data_start + off : data_start + off + n_blocks * 18].reshape(n_blocks, 18)
+      if typ == 2:  # already Q4_0: zero-copy from disk
+        state_dict[name] = tensor[data_start + off : data_start + off + n_blocks * 18].reshape(n_blocks, 18)
+      else:  # other quant types: dequant to f32 via numpy, then requant to Q4_0
+        f32 = _numpy_ggml_dequant(mm, data_start + off, n_elements, typ)
+        state_dict[name] = Tensor(_numpy_f32_to_q4_0(f32))
+        del f32
     elif is_expert:
       # Expert weights: keep as Q4_0 raw blocks for Q4_0ExpertWeights (dequant only selected experts at runtime)
       # Q4_0 experts: read raw bytes directly

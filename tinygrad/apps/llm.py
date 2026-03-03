@@ -6,7 +6,7 @@ from tinygrad.viz.serve import TCPServerWithReuse, HTTPRequestHandler
 
 class SimpleTokenizer:
   def __init__(self, normal_tokens:dict[str, int], special_tokens:dict[str, int], preset:str="llama3"):
-    if preset not in ("llama3","llama-v3","llama-bpe","qwen2","olmo"): raise ValueError(f"Invalid tokenizer preset '{preset}'")
+    if preset not in ("llama3","llama-v3","llama-bpe","qwen2","qwen35","olmo"): raise ValueError(f"Invalid tokenizer preset '{preset}'")
     # https://github.com/openai/gpt-2/blob/9b63575ef42771a015060c964af2c3da4cf7c8ab/src/encoder.py#L9
     bs = [*range(33, 127), *range(161, 173), *range(174, 256)]  # bytes that map to themselves
     self._byte_decoder = {chr(b): b for b in bs} | {chr(256+i): b for i,b in enumerate(b for b in range(256) if b not in bs)}
@@ -54,11 +54,11 @@ class SimpleTokenizer:
   def decode(self, ids:list[int]) -> str: return b''.join(self._tok2bytes[tid] for tid in ids).decode(errors='replace')
   def role(self, role:str):
     if self.preset == 'olmo': return self.encode("<|" + role + "|>\n")  # OLMoE Instruct format
-    if self.preset == 'qwen2': return self.encode("<|im_start|>" + role + "\n")
+    if self.preset in ('qwen2', 'qwen35'): return self.encode("<|im_start|>" + role + "\n")
     return self.encode("<|start_header_id|>" + role + "<|end_header_id|>\n\n")
   def end_turn(self, eos_id:int):
     if self.preset == 'olmo': return self.encode("\n")
-    if self.preset == 'qwen2': return [eos_id] + self.encode("\n")
+    if self.preset in ('qwen2', 'qwen35'): return [eos_id] + self.encode("\n")
     return [eos_id]
 
 @functools.cache
@@ -117,8 +117,12 @@ class GatedDeltaNetBlock:
     self.attn_norm = nn.RMSNorm(dim, norm_eps)
     self.post_attention_norm = nn.RMSNorm(dim, norm_eps)
 
-    # MoE FFN (shared between SSM and attention blocks)
-    if num_experts > 0:
+    # FFN: MoE or dense (shared between SSM and attention blocks)
+    if num_experts == 0:
+      self.ffn_gate = linear(dim, hidden_dim, bias=False)
+      self.ffn_up = linear(dim, hidden_dim, bias=False)
+      self.ffn_down = linear(hidden_dim, dim, bias=False)
+    elif num_experts > 0:
       _ew = expert_weights_cls if expert_weights_cls is not None else ExpertWeights
       self.num_experts_per_tok = num_experts_per_tok
       self.ffn_gate_inp = nn.Linear(dim, num_experts, bias=False)
@@ -275,7 +279,9 @@ class GatedDeltaNetBlock:
           shexp_out = shexp_out * self.ffn_gate_inp_shexp.sigmoid()
         moe_out = moe_out + shexp_out
       return h + moe_out
-    raise NotImplementedError("GatedDeltaNetBlock requires MoE FFN")
+    if hasattr(self, 'ffn_gate'):
+      return h + self.ffn_down(self.ffn_gate(h_norm).silu() * self.ffn_up(h_norm))
+    raise NotImplementedError("GatedDeltaNetBlock requires MoE or dense FFN")
 
   def __call__(self, x:Tensor, start_pos:int|UOp):
     if not hasattr(self, '_state_init'):
@@ -293,10 +299,11 @@ class GatedDeltaNetBlock:
 class TransformerBlock:
   def __init__(self, dim:int, hidden_dim:int, n_heads:int, n_kv_heads:int, norm_eps:float, head_dim:int, rope_theta:float,
                max_context:int=0, qk_norm:int=0, num_experts:int=0, num_experts_per_tok:int=0,
-               shared_hidden_dim:int=0, linear=nn.Linear, expert_weights_cls=None, gated_attn:bool=False):
+               shared_hidden_dim:int=0, linear=nn.Linear, expert_weights_cls=None, gated_attn:bool=False, rope_dim:int=0):
     self.n_heads      = n_heads
     self.n_kv_heads   = n_kv_heads
     self.head_dim     = head_dim
+    self.rope_dim     = rope_dim if rope_dim > 0 else head_dim  # partial RoPE: only rotate first rope_dim dims
     self.rope_theta   = rope_theta
     self.max_context  = max_context
     self.qk_norm      = qk_norm
@@ -355,9 +362,16 @@ class TransformerBlock:
     v = v.reshape(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)  # (B,KvH,T,Hd)
     if self.qk_norm == self.head_dim: q, k = self.attn_q_norm(q), self.attn_k_norm(k)
 
-    freqs_cis = precompute_freqs_cis(self.head_dim, self.max_context, self.rope_theta)[start_pos:start_pos+T]
-    q = apply_rope(q, freqs_cis)
-    k = apply_rope(k, freqs_cis)
+    freqs_cis = precompute_freqs_cis(self.rope_dim, self.max_context, self.rope_theta)[start_pos:start_pos+T]
+    if self.rope_dim < self.head_dim:
+      # Partial RoPE: only rotate first rope_dim dimensions, pass through the rest
+      q_rot, q_pass = q[..., :self.rope_dim], q[..., self.rope_dim:]
+      k_rot, k_pass = k[..., :self.rope_dim], k[..., self.rope_dim:]
+      q = apply_rope(q_rot, freqs_cis).cat(q_pass, dim=-1)
+      k = apply_rope(k_rot, freqs_cis).cat(k_pass, dim=-1)
+    else:
+      q = apply_rope(q, freqs_cis)
+      k = apply_rope(k, freqs_cis)
 
     # TODO: fix assign to behave like this
     assigned_kv = self.cache_kv.uop.after(self.cache_kv[:, :, :, start_pos:start_pos+T, :].uop.assign(Tensor.stack(k, v).contiguous().uop))
@@ -457,7 +471,12 @@ class Transformer:
     shared_hidden_dim = kv.get(f'{arch}.feed_forward_length', 0) if kv.get(f'{arch}.expert_feed_forward_length') else 0
     head_dim = kv.get(f'{arch}.attention.key_length', dim // n_heads)
     rope_theta = kv[f'{arch}.rope.freq_base']
-    qk_norm = int(state_dict['blk.0.attn_q_norm.weight'].shape[0]) if 'blk.0.attn_q_norm.weight' in state_dict else 0
+    rope_dim = kv.get(f'{arch}.rope.dimension_count', 0)  # partial RoPE: 0 = use full head_dim
+    # Detect QK norm — for hybrid models, check the first attention block (not block 0 which may be DeltaNet)
+    _fai = kv.get(f'{arch}.full_attention_interval', 0)
+    first_attn_blk = _fai - 1 if _fai > 0 else 0
+    qk_norm_key = f'blk.{first_attn_blk}.attn_q_norm.weight'
+    qk_norm = int(state_dict[qk_norm_key].shape[0]) if qk_norm_key in state_dict else 0
 
     # Handle tied output weight — both embedding and output are dense (nn.Linear)
     if 'output.weight' not in state_dict:
@@ -492,6 +511,16 @@ class Transformer:
             if state_dict[name].dtype == dtypes.uint8:
               _, dims = info
               state_dict[name] = dequant_q4_0_blocks(state_dict[name], *reversed(dims))
+
+    # Requant non-Q4_0 tensors that the model expects as Q4_0Linear (e.g. Q8_0 ssm_alpha/beta, Q5_K ssm_out)
+    if has_q4_0:
+      for name in list(state_dict.keys()):
+        if name == 'token_embd.weight': continue
+        info = tensor_info.get(name)
+        if info and info[0] != 2 and state_dict[name].dtype != dtypes.uint8:
+          is_quantized_layer = any(k in name for k in _q4_0_layer_keys)
+          if is_quantized_layer:
+            state_dict[name] = tensor_to_q4_0_blocks(state_dict[name])
 
     # Cast non-Q4_0 tensors to float16
     # Native GGUF types (F32/F16) are disk-backed bitcasts — keep as f32. These are small tensors
@@ -528,7 +557,7 @@ class Transformer:
           # Full attention block (every Nth layer) — Qwen3.5 uses gated attention
           blocks.append(TransformerBlock(dim, hidden_dim, n_heads, n_kv_heads, norm_eps, head_dim, rope_theta,
                                          max_context, qk_norm, num_experts, num_experts_per_tok, shared_hidden_dim,
-                                         linear, expert_weights_cls, gated_attn=True))
+                                         linear, expert_weights_cls, gated_attn=True, rope_dim=rope_dim))
         else:
           # DeltaNet SSM block
           blocks.append(GatedDeltaNetBlock(dim, hidden_dim, norm_eps, num_experts=num_experts,
