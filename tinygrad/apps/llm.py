@@ -214,14 +214,18 @@ class GatedDeltaNetBlock:
     y_normed = (self.ssm_norm(y_r) * z_r.silu()).reshape(B, T, self.value_dim)
     return x + self.ssm_out(y_normed)
 
+  @function(precompile=bool(getenv("PRECOMPILE", 0)))
   def _deltanet_step(self, x:Tensor, start_pos:int|UOp) -> Tensor:
     """Single-token autoregressive path."""
     x_norm = self.attn_norm(x)
     B = x.shape[0]
-    qkv = self.attn_qkv(x_norm).reshape(B, -1)
-    z = self.attn_gate(x_norm)
-    b = self.ssm_beta(x_norm)
-    a = self.ssm_alpha(x_norm)
+    # Single fused matmul for all input projections (replaces 4 separate nn.Linear calls)
+    combined = x_norm.linear(self._proj_weight.T)
+    off1, off2, off3 = self.conv_dim, self.conv_dim + self.value_dim, self.conv_dim + self.value_dim + self.num_v_heads
+    qkv = combined[:, :, :off1].reshape(B, -1)
+    z = combined[:, :, off1:off2]
+    a = combined[:, :, off2:off3]
+    b = combined[:, :, off3:]
 
     qkv = self._conv1d_step(qkv).unsqueeze(1)
     q, k, v = qkv[:, :, :self.key_dim], qkv[:, :, self.key_dim:self.key_dim*2], qkv[:, :, self.key_dim*2:]
@@ -232,10 +236,10 @@ class GatedDeltaNetBlock:
     beta = b.sigmoid().transpose(1, 2)
     g = (self.ssm_a * (a + self.ssm_dt).softplus()).transpose(1, 2)
 
+    q, k = l2norm(q, dim=-1), l2norm(k, dim=-1)
     if self.gqa_factor > 1:
       q = q.repeat_interleave(self.gqa_factor, dim=1)
       k = k.repeat_interleave(self.gqa_factor, dim=1)
-    q, k = l2norm(q, dim=-1), l2norm(k, dim=-1)
 
     y = self._deltanet_recurrent(q, k, v, g, beta)
     y = y.transpose(1, 2).reshape(B, 1, self.value_dim)
@@ -244,6 +248,7 @@ class GatedDeltaNetBlock:
     y_normed = (self.ssm_norm(y_r) * z_r.silu()).reshape(B, 1, self.value_dim)
     return x + self.ssm_out(y_normed)
 
+  @function(precompile=bool(getenv("PRECOMPILE", 0)))
   def _feed_forward(self, h:Tensor) -> Tensor:
     h_norm = self.post_attention_norm(h)
     if hasattr(self, 'ffn_gate_exps'):
@@ -265,6 +270,9 @@ class GatedDeltaNetBlock:
       B = x.shape[0]
       self.conv_state = Tensor.zeros(B, self.conv_dim, self.d_conv, device=x.device).contiguous().realize()
       self.ssm_state = Tensor.zeros(B, self.num_v_heads, self.head_k_dim, self.head_v_dim, device=x.device).contiguous().realize()
+      # Pre-combine projection weights: 4 separate linears → 1 fused matmul
+      self._proj_weight = Tensor.cat(self.attn_qkv.weight, self.attn_gate.weight,
+                                      self.ssm_alpha.weight, self.ssm_beta.weight, dim=0).contiguous().realize()
       self._state_init = True
     # DeltaNet always uses single-step path — prefill loops externally in Transformer.__call__
     h = self._deltanet_step(x, start_pos)
