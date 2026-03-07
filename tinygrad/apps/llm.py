@@ -178,6 +178,8 @@ class TransformerBlock:
       self.cache_kv = Tensor.zeros(2, x.shape[0], self.n_kv_heads, self.max_context, self.head_dim, device=x.device).clone()
     return self._feed_forward(self._attention(x, start_pos)).contiguous()
 
+CHUNK_SIZE = 64  # fixed chunk size for GatedDeltaNet parallel prefill
+
 class GatedDeltaNetBlock:
   def __init__(self, dim:int, hidden_dim:int, norm_eps:float, n_heads:int, head_dim:int, conv_kernel:int):
     self.n_heads, self.head_dim, self.conv_kernel = n_heads, head_dim, conv_kernel
@@ -200,44 +202,170 @@ class GatedDeltaNetBlock:
     self.ffn_up     = nn.Linear(dim, hidden_dim, bias=False)
     self.ffn_down   = nn.Linear(hidden_dim, dim, bias=False)
 
-  def __call__(self, x:Tensor, start_pos:int|UOp):
+  def _ensure_states(self, x:Tensor):
+    B, inner = x.shape[0], self.n_heads * self.head_dim
+    if not hasattr(self, "conv_state"):
+      self.conv_state = Tensor.zeros(B, inner * 3, self.conv_kernel - 1, device=x.device).clone()
+    if not hasattr(self, "ssm_state"):
+      self.ssm_state = Tensor.zeros(B, self.n_heads, self.head_dim, self.head_dim, device=x.device).clone()
+
+  def _rollout(self, x:Tensor, start_pos:int|UOp) -> Tensor:
+    """Single-token recurrence (T=1). Original algorithm."""
     B = x.shape[0]
-    inner = self.n_heads * self.head_dim
-    x_s = x[:, 0]                                                                      # (B,D) — squeeze T (always 1)
+    H, d = self.n_heads, self.head_dim
+    inner = H * d
+    x_s = x[:, 0]                                                                      # (B,D)
     x_norm = self.attn_norm(x_s)
 
     # input projections
     qkv = self.attn_qkv(x_norm)                                                       # (B,inner*3)
-    z = self.attn_gate(x_norm).reshape(B, self.n_heads, self.head_dim)                 # (B,H,Hd)
+    z = self.attn_gate(x_norm).reshape(B, H, d)                                       # (B,H,Hd)
     beta = self.ssm_beta(x_norm).sigmoid()                                             # (B,H)
     g = (-self.ssm_a.exp() * (self.ssm_alpha(x_norm) + self.ssm_dt).softplus())       # (B,H)
 
-    # causal depthwise conv1d
-    if not hasattr(self, "conv_state"):
-      self.conv_state = Tensor.zeros(B, inner * 3, self.conv_kernel - 1, device=x.device).clone()
+    # causal depthwise conv1d (single token)
     conv_window = self.conv_state.cat(qkv.unsqueeze(-1), dim=-1)                       # (B,C,K)
-    qkv_conv = (conv_window * self.ssm_conv1d.reshape(1, -1, self.conv_kernel)).sum(-1).silu().contiguous()  # (B,C)
+    qkv_conv = (conv_window * self.ssm_conv1d.reshape(1, -1, self.conv_kernel)).sum(-1).silu().contiguous()
     qkv_conv = write_after(self.conv_state, conv_window[:, :, 1:].contiguous(), qkv_conv)
 
     # split Q, K, V, L2 normalize, scale Q
-    q, k, v = [qkv_conv[:, i*inner:(i+1)*inner].reshape(B, self.n_heads, self.head_dim) for i in range(3)]
-    q, k = q.normalize(dim=-1) * (self.head_dim ** -0.5), k.normalize(dim=-1)
+    q, k, v = [qkv_conv[:, i*inner:(i+1)*inner].reshape(B, H, d) for i in range(3)]
+    q, k = q.normalize(dim=-1) * (d ** -0.5), k.normalize(dim=-1)
 
-    # gated delta rule recurrence (single token)
-    if not hasattr(self, "ssm_state"):
-      self.ssm_state = Tensor.zeros(B, self.n_heads, self.head_dim, self.head_dim, device=x.device).clone()
+    # gated delta rule recurrence
+    state = self.ssm_state * g.exp().unsqueeze(-1).unsqueeze(-1)                       # (B,H,Hd,Hd)
+    delta = (v - (state * k.unsqueeze(-1)).sum(-2)) * beta.unsqueeze(-1)               # (B,H,Hd)
+    state = (state + k.unsqueeze(-1) * delta.unsqueeze(-2)).contiguous()                # (B,H,Hd,Hd)
 
-    state = self.ssm_state * g.exp().unsqueeze(-1).unsqueeze(-1)                       # (B,H,Hd,Hd) decay
-    delta = (v - (state * k.unsqueeze(-1)).sum(-2)) * beta.unsqueeze(-1)               # (B,H,Hd)    prediction error
-    state = (state + k.unsqueeze(-1) * delta.unsqueeze(-2)).contiguous()                # (B,H,Hd,Hd) write
-
-    o = (state * q.unsqueeze(-1)).sum(-2).contiguous()                                 # (B,H,Hd)    read
+    o = (state * q.unsqueeze(-1)).sum(-2).contiguous()                                 # (B,H,Hd)
     o = write_after(self.ssm_state, state, o)
 
-    # gated output: RMSNorm(o) * SiLU(z), then project + residual + FFN
+    # gated output + residual + FFN
     h = x_s + self.ssm_out((self.ssm_norm(o) * z.silu()).reshape(B, -1))
     h_norm = self.ffn_norm(h)
     return (h + self.ffn_down(self.ffn_gate(h_norm).silu().contiguous() * self.ffn_up(h_norm))).reshape(B, 1, -1).contiguous()
+
+  def _prefill(self, x:Tensor, start_pos:int|UOp) -> Tensor:
+    """Chunked parallel prefill (T > 1). Pads T to CHUNK_SIZE, processes in parallel via WY/UT transform."""
+    C = CHUNK_SIZE
+    B, T = x.shape[0], x.shape[1]
+    H, d = self.n_heads, self.head_dim
+    inner = H * d
+
+    x_norm = self.attn_norm(x)                                                         # (B,T,D)
+
+    # input projections — all (B,T,...)
+    qkv = self.attn_qkv(x_norm)                                                       # (B,T,inner*3)
+    z = self.attn_gate(x_norm).reshape(B, T, H, d)                                    # (B,T,H,d)
+    beta = self.ssm_beta(x_norm).sigmoid()                                             # (B,T,H)
+    g = (-self.ssm_a.exp() * (self.ssm_alpha(x_norm) + self.ssm_dt).softplus())       # (B,T,H)
+
+    # causal depthwise conv1d over T tokens
+    K = self.conv_kernel
+    qkv_t = qkv.permute(0, 2, 1)                                                      # (B,inner*3,T)
+    padded = self.conv_state.cat(qkv_t, dim=-1)                                        # (B,inner*3,T+K-1)
+    # build (B,inner*3,T,K) windows via shifted slices
+    windows = Tensor.stack(*[padded[:, :, i:i+T] for i in range(K)], dim=-1)
+    qkv_conv = (windows * self.ssm_conv1d.reshape(1, -1, 1, K)).sum(-1).silu()         # (B,inner*3,T)
+    qkv_conv = qkv_conv.contiguous()
+    new_conv_state = padded[:, :, T:].contiguous()                                     # (B,inner*3,K-1) — last K-1 positions
+    qkv_conv = write_after(self.conv_state, new_conv_state, qkv_conv)
+    qkv_conv = qkv_conv.permute(0, 2, 1)                                              # (B,T,inner*3)
+
+    # split Q, K, V, L2 normalize, scale Q — all (B,T,H,d)
+    q = qkv_conv[:, :, 0*inner:1*inner].reshape(B, T, H, d)
+    k = qkv_conv[:, :, 1*inner:2*inner].reshape(B, T, H, d)
+    v = qkv_conv[:, :, 2*inner:3*inner].reshape(B, T, H, d)
+    q, k = q.normalize(dim=-1) * (d ** -0.5), k.normalize(dim=-1)
+
+    # pad T → C along dim 1, with zeros (beta=0, g=0 → padded positions are no-ops)
+    q  =  q.pad((None, (0, C - T), None, None))                                       # (B,C,H,d)
+    k  =  k.pad((None, (0, C - T), None, None))                                       # (B,C,H,d)
+    v  =  v.pad((None, (0, C - T), None, None))                                       # (B,C,H,d)
+    g  =  g.pad((None, (0, C - T), None))                                              # (B,C,H)
+    beta = beta.pad((None, (0, C - T), None))                                          # (B,C,H)
+
+    # transpose to (B,H,C,d) for matmuls
+    q = q.permute(0, 2, 1, 3)                                                          # (B,H,C,d)
+    k = k.permute(0, 2, 1, 3)                                                          # (B,H,C,d)
+    v = v.permute(0, 2, 1, 3)                                                          # (B,H,C,d)
+    g = g.permute(0, 2, 1)                                                             # (B,H,C)
+    beta = beta.permute(0, 2, 1)                                                       # (B,H,C)
+
+    # cumulative sum of log-gates within the chunk
+    g_cumsum = g.cumsum(axis=-1)                                                       # (B,H,C)
+
+    # decay mask: Gamma[i,j] = exp(g_cumsum[i] - g_cumsum[j]) for i >= j
+    g_cumsum_i = g_cumsum.unsqueeze(-1)                                                # (B,H,C,1)
+    g_cumsum_j = g_cumsum.unsqueeze(-2)                                                # (B,H,1,C)
+    L_mask = (g_cumsum_i - g_cumsum_j).exp()                                           # (B,H,C,C)
+
+    # === UT Transform (forward substitution) ===
+    # Build adjacency matrix A = -tril(diag(beta) @ (L_mask * K @ K^T), -1)
+    k_beta = k * beta.unsqueeze(-1)                                                    # (B,H,C,d)
+    attn_raw = -(k_beta @ k.transpose(-1, -2)) * L_mask                               # (B,H,C,C)
+    # zero out upper triangle + diagonal (keep strictly lower triangular)
+    attn = attn_raw.tril(-1)                                                           # (B,H,C,C)
+
+    # forward substitution: (I - A)^{-1} via sequential row updates
+    # A is strictly lower triangular, so A^C = 0 and this terminates exactly
+    for i in range(1, C):
+      # attn[..., i, :i] += (attn[..., i, :i, None] * attn[..., :i, :i]).sum(-2)
+      row_i = attn[:, :, i:i+1, :i]                                                   # (B,H,1,i)
+      block = attn[:, :, :i, :i]                                                       # (B,H,i,i)
+      correction = (row_i @ block)                                                     # (B,H,1,i)
+      # build full-row update: zeros except positions :i get correction
+      pad_right = Tensor.zeros(*correction.shape[:-1], C - i, device=x.device)
+      update_row = correction.cat(pad_right, dim=-1)                                   # (B,H,1,C)
+      pad_top = Tensor.zeros(*attn.shape[:-2], i, C, device=x.device)
+      pad_bot = Tensor.zeros(*attn.shape[:-2], C - i - 1, C, device=x.device)
+      update = pad_top.cat(update_row, dim=-2).cat(pad_bot, dim=-2)                    # (B,H,C,C)
+      attn = attn + update
+    attn = attn + Tensor.eye(C, device=x.device)                                       # (B,H,C,C)
+
+    # corrected values and keys
+    u = attn @ (v * beta.unsqueeze(-1))                                                # (B,H,C,d) — "what to write"
+    w = attn @ (k * (beta * g_cumsum.exp()).unsqueeze(-1))                              # (B,H,C,d) — "where to write, with decay"
+
+    # === Intra-chunk output computation ===
+    S = self.ssm_state                                                                 # (B,H,d,d)
+
+    # inter-chunk contribution: query reads from previous state
+    q_scaled = q * g_cumsum.unsqueeze(-1).exp()                                        # (B,H,C,d) — queries scaled by cumulative decay
+    o_inter = q_scaled @ S                                                             # (B,H,C,d) — contribution from prior state
+
+    # state-corrected values: subtract contribution of current state from u
+    w_S = w @ S                                                                        # (B,H,C,d) — w @ S (state projection)
+    v_new = u - w_S                                                                    # (B,H,C,d) — corrected values
+
+    # intra-chunk causal attention: (Q @ K^T * causal_decay) @ v_new
+    qk = q @ k.transpose(-1, -2)                                                      # (B,H,C,C)
+    causal_mask = L_mask.tril(0)                                                       # lower triangular with decay
+    o_intra = (qk * causal_mask) @ v_new                                               # (B,H,C,d)
+
+    o = o_inter + o_intra                                                              # (B,H,C,d)
+
+    # === State update ===
+    g_total = g_cumsum[:, :, -1]                                                       # (B,H) — total chunk decay
+    # keys scaled to chunk end: k_r * exp(g_total - g_cumsum_r)
+    k_end = k * (g_total.unsqueeze(-1).unsqueeze(-1) - g_cumsum.unsqueeze(-1)).exp()   # (B,H,C,d)
+    new_state = (S * g_total.unsqueeze(-1).unsqueeze(-1).exp() +
+                 k_end.transpose(-1, -2) @ v_new).contiguous()                        # (B,H,d,d)
+
+    # slice output back to T positions, transpose to (B,T,H,d)
+    o = o[:, :, :T, :].permute(0, 2, 1, 3).contiguous()                               # (B,T,H,d)
+    o = write_after(self.ssm_state, new_state, o)
+
+    # gated output: RMSNorm(o) * SiLU(z), then project + residual + FFN
+    h = x + self.ssm_out((self.ssm_norm(o) * z.silu()).reshape(B, T, -1))              # (B,T,D)
+    h_norm = self.ffn_norm(h)
+    return (h + self.ffn_down(self.ffn_gate(h_norm).silu().contiguous() * self.ffn_up(h_norm))).contiguous()
+
+  def __call__(self, x:Tensor, start_pos:int|UOp):
+    self._ensure_states(x)
+    if resolve(x.shape[1] != 1):
+      return self._prefill(x, start_pos)
+    return self._rollout(x, start_pos)
 
 class Transformer:
   def __init__(self, *, num_blocks, dim, hidden_dim, n_heads, n_kv_heads, norm_eps, vocab_size, head_dim:int, rope_theta:float,
@@ -320,7 +448,8 @@ class Transformer:
     return sum(1 for _ in itertools.takewhile(lambda ab: ab[0] == ab[1], zip(tokens[:-1], self._cached_tokens)))
 
   def generate(self, tokens:list[int], chunk_size:int=32):
-    if any(isinstance(b, GatedDeltaNetBlock) for b in self.blk): chunk_size = 1  # recurrent layers require T=1
+    has_recurrent = any(isinstance(b, GatedDeltaNetBlock) for b in self.blk)
+    if has_recurrent: chunk_size = min(chunk_size, CHUNK_SIZE)  # recurrent layers support up to CHUNK_SIZE
     v_start_pos = UOp.variable("start_pos", 0, self.max_context-1)
     v_toks = UOp.variable("toks", 1, chunk_size) if chunk_size > 1 else None
     # assign all input tokens once, then slice from start_pos for the model call
