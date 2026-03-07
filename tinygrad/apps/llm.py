@@ -179,22 +179,24 @@ class TransformerBlock:
     return self._feed_forward(self._attention(x, start_pos)).contiguous()
 
 class GatedDeltaNetBlock:
-  def __init__(self, dim:int, hidden_dim:int, norm_eps:float, n_heads:int, head_dim:int, conv_kernel:int):
-    self.n_heads, self.head_dim, self.conv_kernel = n_heads, head_dim, conv_kernel
-    inner = n_heads * head_dim
+  def __init__(self, dim:int, hidden_dim:int, norm_eps:float, n_k_heads:int, n_v_heads:int, head_dim:int, conv_kernel:int):
+    self.n_k_heads, self.n_v_heads, self.head_dim, self.conv_kernel = n_k_heads, n_v_heads, head_dim, conv_kernel
+    self.kv_repeat = n_v_heads // n_k_heads
+    key_dim, value_dim = n_k_heads * head_dim, n_v_heads * head_dim
+    conv_dim = key_dim * 2 + value_dim
 
     self.attn_norm  = nn.RMSNorm(dim, norm_eps)
     self.ffn_norm   = nn.RMSNorm(dim, norm_eps)  # loaded from post_attention_norm
     self.ssm_norm   = nn.RMSNorm(head_dim, norm_eps)
 
-    self.attn_qkv   = nn.Linear(dim, inner * 3, bias=False)
-    self.attn_gate  = nn.Linear(dim, inner, bias=False)
-    self.ssm_alpha  = nn.Linear(dim, n_heads, bias=False)
-    self.ssm_beta   = nn.Linear(dim, n_heads, bias=False)
-    self.ssm_out    = nn.Linear(inner, dim, bias=False)
-    self.ssm_a      = Tensor.zeros(n_heads)
-    self.ssm_dt     = Tensor.zeros(n_heads)
-    self.ssm_conv1d = Tensor.zeros(inner * 3, conv_kernel)
+    self.attn_qkv   = nn.Linear(dim, conv_dim, bias=False)
+    self.attn_gate  = nn.Linear(dim, value_dim, bias=False)
+    self.ssm_alpha  = nn.Linear(dim, n_v_heads, bias=False)
+    self.ssm_beta   = nn.Linear(dim, n_v_heads, bias=False)
+    self.ssm_out    = nn.Linear(value_dim, dim, bias=False)
+    self.ssm_a      = Tensor.zeros(n_v_heads)
+    self.ssm_dt     = Tensor.zeros(n_v_heads)
+    self.ssm_conv1d = Tensor.zeros(conv_dim, conv_kernel)
 
     self.ffn_gate   = nn.Linear(dim, hidden_dim, bias=False)
     self.ffn_up     = nn.Linear(dim, hidden_dim, bias=False)
@@ -202,36 +204,43 @@ class GatedDeltaNetBlock:
 
   def __call__(self, x:Tensor, start_pos:int|UOp):
     B = x.shape[0]
-    inner = self.n_heads * self.head_dim
+    key_dim, value_dim = self.n_k_heads * self.head_dim, self.n_v_heads * self.head_dim
     x_s = x[:, 0]                                                                      # (B,D) — squeeze T (always 1)
     x_norm = self.attn_norm(x_s)
 
     # input projections
-    qkv = self.attn_qkv(x_norm)                                                       # (B,inner*3)
-    z = self.attn_gate(x_norm).reshape(B, self.n_heads, self.head_dim)                 # (B,H,Hd)
-    beta = self.ssm_beta(x_norm).sigmoid()                                             # (B,H)
-    g = (-self.ssm_a.exp() * (self.ssm_alpha(x_norm) + self.ssm_dt).softplus())       # (B,H)
+    qkv = self.attn_qkv(x_norm)                                                       # (B, key_dim*2+value_dim)
+    z = self.attn_gate(x_norm).reshape(B, self.n_v_heads, self.head_dim)               # (B,Hv,Hd)
+    beta = self.ssm_beta(x_norm).sigmoid()                                             # (B,Hv)
+    g = (-self.ssm_a.exp() * (self.ssm_alpha(x_norm) + self.ssm_dt).softplus())        # (B,Hv) — decay
 
     # causal depthwise conv1d
     if not hasattr(self, "conv_state"):
-      self.conv_state = Tensor.zeros(B, inner * 3, self.conv_kernel - 1, device=x.device).clone()
+      self.conv_state = Tensor.zeros(B, key_dim * 2 + value_dim, self.conv_kernel - 1, device=x.device).clone()
     conv_window = self.conv_state.cat(qkv.unsqueeze(-1), dim=-1)                       # (B,C,K)
     qkv_conv = (conv_window * self.ssm_conv1d.reshape(1, -1, self.conv_kernel)).sum(-1).silu().contiguous()  # (B,C)
     qkv_conv = write_after(self.conv_state, conv_window[:, :, 1:].contiguous(), qkv_conv)
 
-    # split Q, K, V, L2 normalize, scale Q
-    q, k, v = [qkv_conv[:, i*inner:(i+1)*inner].reshape(B, self.n_heads, self.head_dim) for i in range(3)]
+    # split Q, K, V — Q and K have n_k_heads, V has n_v_heads
+    q = qkv_conv[:, :key_dim].reshape(B, self.n_k_heads, self.head_dim)
+    k = qkv_conv[:, key_dim:key_dim*2].reshape(B, self.n_k_heads, self.head_dim)
+    v = qkv_conv[:, key_dim*2:].reshape(B, self.n_v_heads, self.head_dim)
     q, k = q.normalize(dim=-1) * (self.head_dim ** -0.5), k.normalize(dim=-1)
 
-    # gated delta rule recurrence (single token)
+    # expand Q, K to match V head count (like GQA repeat_kv)
+    if self.kv_repeat > 1:
+      q = q.repeat_interleave(self.kv_repeat, dim=1)                                  # (B,Hv,Hd)
+      k = k.repeat_interleave(self.kv_repeat, dim=1)                                  # (B,Hv,Hd)
+
+    # gated delta rule recurrence (single token) — state is (B, Hv, Hd, Hd)
     if not hasattr(self, "ssm_state"):
-      self.ssm_state = Tensor.zeros(B, self.n_heads, self.head_dim, self.head_dim, device=x.device).clone()
+      self.ssm_state = Tensor.zeros(B, self.n_v_heads, self.head_dim, self.head_dim, device=x.device).clone()
 
-    state = self.ssm_state * g.exp().unsqueeze(-1).unsqueeze(-1)                       # (B,H,Hd,Hd) decay
-    delta = (v - (state * k.unsqueeze(-1)).sum(-2)) * beta.unsqueeze(-1)               # (B,H,Hd)    prediction error
-    state = (state + k.unsqueeze(-1) * delta.unsqueeze(-2)).contiguous()                # (B,H,Hd,Hd) write
+    state = self.ssm_state * g.exp().unsqueeze(-1).unsqueeze(-1)                       # (B,Hv,Hd,Hd) decay
+    delta = (v - (state * k.unsqueeze(-1)).sum(-2)) * beta.unsqueeze(-1)               # (B,Hv,Hd)    prediction error
+    state = (state + k.unsqueeze(-1) * delta.unsqueeze(-2)).contiguous()                # (B,Hv,Hd,Hd) write
 
-    o = (state * q.unsqueeze(-1)).sum(-2).contiguous()                                 # (B,H,Hd)    read
+    o = (state * q.unsqueeze(-1)).sum(-2).contiguous()                                 # (B,Hv,Hd)    read
     o = write_after(self.ssm_state, state, o)
 
     # gated output: RMSNorm(o) * SiLU(z), then project + residual + FFN
@@ -291,7 +300,14 @@ class Transformer:
 
     if arch == 'qwen35':
       full_attn_interval, num_blocks = kv[f'{arch}.full_attention_interval'], kv[f'{arch}.block_count']
-      ssm_n_heads, ssm_head_dim, conv_kernel = kv[f'{arch}.ssm.group_count'], kv[f'{arch}.ssm.state_size'], kv[f'{arch}.ssm.conv_kernel']
+      ssm_n_k_heads, ssm_head_dim, conv_kernel = kv[f'{arch}.ssm.group_count'], kv[f'{arch}.ssm.state_size'], kv[f'{arch}.ssm.conv_kernel']
+      ssm_inner = kv[f'{arch}.ssm.inner_size']
+      ssm_key_dim = ssm_n_k_heads * ssm_head_dim
+      ssm_n_v_heads = (ssm_inner - ssm_key_dim * 2) // ssm_head_dim   # conv_dim = key_dim*2 + value_dim → value_dim = inner - key_dim*2... no
+      # GGUF: inner_size = value_dim (out_proj input), group_count = n_k_heads, state_size = head_dim
+      # value_dim = inner_size = 4096, key_dim = group_count * state_size = 16*128 = 2048
+      # n_v_heads = value_dim / state_size = 4096 / 128 = 32
+      ssm_n_v_heads = ssm_inner // ssm_head_dim
       rope_dim = kv[f'{arch}.rope.dimension_count']
       blk: list = []
       for i in range(num_blocks):
@@ -299,7 +315,7 @@ class Transformer:
           blk.append(TransformerBlock(dim, hidden_dim, n_heads, n_kv_heads, norm_eps, head_dim, rope_theta, max_context,
                                       qk_norm=qk_norm, rope_dim=rope_dim, attn_gate=True))
         else:
-          blk.append(GatedDeltaNetBlock(dim, hidden_dim, norm_eps, ssm_n_heads, ssm_head_dim, conv_kernel))
+          blk.append(GatedDeltaNetBlock(dim, hidden_dim, norm_eps, ssm_n_k_heads, ssm_n_v_heads, ssm_head_dim, conv_kernel))
       state_dict = {k.replace('post_attention_norm', 'ffn_norm').replace('ssm_dt.bias', 'ssm_dt').replace('ssm_conv1d.weight', 'ssm_conv1d'):
                     v for k, v in state_dict.items()}
     else:
