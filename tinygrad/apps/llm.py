@@ -178,7 +178,7 @@ class TransformerBlock:
       self.cache_kv = Tensor.zeros(2, x.shape[0], self.n_kv_heads, self.max_context, self.head_dim, device=x.device).clone()
     return self._feed_forward(self._attention(x, start_pos)).contiguous()
 
-CHUNK_SIZE = 64  # fixed chunk size for GatedDeltaNet parallel prefill
+CHUNK_SIZE = 16  # fixed chunk size for GatedDeltaNet parallel prefill (small = fewer graph ops for BEAM)
 
 class GatedDeltaNetBlock:
   def __init__(self, dim:int, hidden_dim:int, norm_eps:float, n_k_heads:int, n_v_heads:int, head_dim:int, conv_kernel:int):
@@ -310,23 +310,19 @@ class GatedDeltaNetBlock:
     g_cumsum_j = g_cumsum.unsqueeze(-2)                                                # (B,Hv,1,C)
     L_mask = (g_cumsum_i - g_cumsum_j).exp()                                           # (B,Hv,C,C)
 
-    # === UT Transform (forward substitution) ===
+    # === UT Transform (Neumann series doubling) ===
     k_beta = k * beta.unsqueeze(-1)                                                    # (B,Hv,C,d)
-    attn_raw = -(k_beta @ k.transpose(-1, -2)) * L_mask                               # (B,Hv,C,C)
-    attn = attn_raw.tril(-1)                                                           # (B,Hv,C,C)
+    A = (-(k_beta @ k.transpose(-1, -2)) * L_mask).tril(-1)                           # (B,Hv,C,C) strict lower tri
 
-    # forward substitution: (I - A)^{-1} via sequential row updates
-    for i in range(1, C):
-      row_i = attn[:, :, i:i+1, :i]                                                   # (B,Hv,1,i)
-      block = attn[:, :, :i, :i]                                                       # (B,Hv,i,i)
-      correction = (row_i @ block)                                                     # (B,Hv,1,i)
-      pad_right = Tensor.zeros(*correction.shape[:-1], C - i, device=x.device)
-      update_row = correction.cat(pad_right, dim=-1)                                   # (B,Hv,1,C)
-      pad_top = Tensor.zeros(*attn.shape[:-2], i, C, device=x.device)
-      pad_bot = Tensor.zeros(*attn.shape[:-2], C - i - 1, C, device=x.device)
-      update = pad_top.cat(update_row, dim=-2).cat(pad_bot, dim=-2)                    # (B,Hv,C,C)
-      attn = attn + update
-    attn = attn + Tensor.eye(C, device=x.device)                                       # (B,Hv,C,C)
+    # (I-A)^{-1} = (I+A)(I+A^2)(I+A^4)...(I+A^{C/2}) since A is nilpotent (A^C = 0)
+    eye_C = Tensor.eye(C, device=x.device)
+    attn = (eye_C + A).contiguous()
+    An = A
+    n = 1
+    while n < C:
+      An = (An @ An).contiguous()                                                      # A^{2^k}
+      attn = (attn @ (eye_C + An)).contiguous()                                        # accumulate
+      n *= 2
 
     # corrected values and keys
     u = attn @ (v * beta.unsqueeze(-1))                                                # (B,Hv,C,d)
@@ -477,12 +473,18 @@ class Transformer:
     while len(tokens) < self.max_context:
       sp = v_start_pos.bind(start_pos)
       if self._is_hybrid:
-        # hybrid: always process 1 token via rollout_jit, but use symbolic v_toks for better JIT graph
-        if v_toks is not None:
-          out = self.rollout_jit(t[:, sp:sp+v_toks.bind(1)], sp).realize()
+        if start_pos < len(tokens) and v_toks is not None:
+          # prefill phase: process up to CHUNK_SIZE tokens at once
+          nt = v_toks.bind(min(chunk_size, len(tokens) - start_pos))
+          out = self.prefill_jit(t[:, sp:sp+nt], sp).realize()
+          start_pos += nt.val
         else:
-          out = self.rollout_jit(t[:, sp:sp+1], sp).realize()
-        start_pos += 1
+          # decode phase: one token at a time via rollout
+          if v_toks is not None:
+            out = self.rollout_jit(t[:, sp:sp+v_toks.bind(1)], sp).realize()
+          else:
+            out = self.rollout_jit(t[:, sp:sp+1], sp).realize()
+          start_pos += 1
       elif v_toks is not None:
         nt = v_toks.bind(min(chunk_size, len(tokens) - start_pos))
         out = self(t[:, sp:sp+nt] if out is None else out, sp).realize()
