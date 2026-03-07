@@ -459,8 +459,7 @@ class Transformer:
     return sum(1 for _ in itertools.takewhile(lambda ab: ab[0] == ab[1], zip(tokens[:-1], self._cached_tokens)))
 
   def generate(self, tokens:list[int], chunk_size:int=32):
-    has_recurrent = any(isinstance(b, GatedDeltaNetBlock) for b in self.blk)
-    if has_recurrent: chunk_size = min(chunk_size, CHUNK_SIZE)  # recurrent layers support up to CHUNK_SIZE
+    if any(isinstance(b, GatedDeltaNetBlock) for b in self.blk): chunk_size = 1  # TODO: enable chunked prefill once UT transform perf is validated
     v_start_pos = UOp.variable("start_pos", 0, self.max_context-1)
     v_toks = UOp.variable("toks", 1, chunk_size) if chunk_size > 1 else None
     # assign all input tokens once, then slice from start_pos for the model call
