@@ -229,7 +229,6 @@ class GatedDeltaNetBlock:
     """Single-token recurrence (T=1)."""
     B = x.shape[0]
     Hv, d = self.n_v_heads, self.head_dim
-    value_dim = Hv * d
     x_s = x[:, 0]                                                                      # (B,D)
     x_norm = self.attn_norm(x_s)
 
@@ -265,8 +264,6 @@ class GatedDeltaNetBlock:
     C = CHUNK_SIZE
     B, T = x.shape[0], x.shape[1]
     Hv, d = self.n_v_heads, self.head_dim
-    value_dim = Hv * d
-    conv_dim = self.n_k_heads * d * 2 + value_dim
 
     x_norm = self.attn_norm(x)                                                         # (B,T,D)
 
