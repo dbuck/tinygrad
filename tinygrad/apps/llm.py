@@ -367,9 +367,11 @@ class GatedDeltaNetBlock:
 
   def __call__(self, x:Tensor, start_pos:int|UOp):
     self._ensure_states(x)
-    if resolve(x.shape[1] != 1):
-      return self._prefill(x, start_pos)
     return self._rollout(x, start_pos)
+
+  def call_prefill(self, x:Tensor, start_pos:int|UOp):
+    self._ensure_states(x)
+    return self._prefill(x, start_pos)
 
 class Transformer:
   def __init__(self, *, num_blocks, dim, hidden_dim, n_heads, n_kv_heads, norm_eps, vocab_size, head_dim:int, rope_theta:float,
@@ -381,14 +383,21 @@ class Transformer:
     self.output = nn.Linear(dim, vocab_size, bias=False)
     self.max_context = max_context
     self._cached_tokens: list[int] = []
+    self._is_hybrid = blk is not None and any(isinstance(b, GatedDeltaNetBlock) for b in (blk or []))
     # we specialize the JIT for prefill and rollout
-    self.prefill_jit = TinyJit(self.forward)
-    self.rollout_jit = TinyJit(self.forward)
+    self.prefill_jit = TinyJit(self.forward_prefill if self._is_hybrid else self.forward)
+    self.rollout_jit = TinyJit(self.forward if self._is_hybrid else self.forward)
 
   def forward(self, tokens:Tensor, start_pos:int|UOp) -> Tensor:
     x = self.token_embd(tokens)                           # (B, T, D)
     for block in self.blk: x = block(x, start_pos)
     # TODO: add temperature
+    return self.output(self.output_norm(x))[:, -1, :].softmax(-1, dtype="float").argmax(-1, keepdim=True)
+
+  def forward_prefill(self, tokens:Tensor, start_pos:int|UOp) -> Tensor:
+    x = self.token_embd(tokens)                           # (B, T, D)
+    for block in self.blk:
+      x = block.call_prefill(x, start_pos) if isinstance(block, GatedDeltaNetBlock) else block(x, start_pos)
     return self.output(self.output_norm(x))[:, -1, :].softmax(-1, dtype="float").argmax(-1, keepdim=True)
 
   def __call__(self, tokens:Tensor, start_pos:int|UOp=0) -> Tensor:
@@ -459,7 +468,7 @@ class Transformer:
     return sum(1 for _ in itertools.takewhile(lambda ab: ab[0] == ab[1], zip(tokens[:-1], self._cached_tokens)))
 
   def generate(self, tokens:list[int], chunk_size:int=32):
-    if any(isinstance(b, GatedDeltaNetBlock) for b in self.blk): chunk_size = 1  # TODO: enable chunked prefill once UT transform perf is validated
+    if self._is_hybrid: chunk_size = min(chunk_size, CHUNK_SIZE)
     v_start_pos = UOp.variable("start_pos", 0, self.max_context-1)
     v_toks = UOp.variable("toks", 1, chunk_size) if chunk_size > 1 else None
     # assign all input tokens once, then slice from start_pos for the model call
@@ -470,7 +479,14 @@ class Transformer:
     out = None
     while len(tokens) < self.max_context:
       sp = v_start_pos.bind(start_pos)
-      if v_toks is not None:
+      if self._is_hybrid:
+        # hybrid: always process 1 token via rollout_jit, but use symbolic v_toks for better JIT graph
+        if v_toks is not None:
+          out = self.rollout_jit(t[:, sp:sp+v_toks.bind(1)], sp).realize()
+        else:
+          out = self.rollout_jit(t[:, sp:sp+1], sp).realize()
+        start_pos += 1
+      elif v_toks is not None:
         nt = v_toks.bind(min(chunk_size, len(tokens) - start_pos))
         out = self(t[:, sp:sp+nt] if out is None else out, sp).realize()
         start_pos += nt.val
@@ -480,10 +496,6 @@ class Transformer:
       # chunked prefill: keep processing until all prompt tokens are consumed
       if start_pos < len(tokens): continue
       tokens.append(int(out.item()))
-      # for recurrent models, write generated token into t so next iteration reads from t consistently
-      if v_toks is None:
-        t_list[start_pos] = tokens[-1]
-        t = Tensor(t_list, dtype="int32").reshape(1, self.max_context)
       self._cached_tokens = tokens[:]
       yield tokens[-1]
 
