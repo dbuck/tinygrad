@@ -473,18 +473,12 @@ class Transformer:
     while len(tokens) < self.max_context:
       sp = v_start_pos.bind(start_pos)
       if self._is_hybrid:
-        if start_pos < len(tokens) and v_toks is not None:
-          # prefill phase: process up to CHUNK_SIZE tokens at once
-          nt = v_toks.bind(min(chunk_size, len(tokens) - start_pos))
-          out = self.prefill_jit(t[:, sp:sp+nt], sp).realize()
-          start_pos += nt.val
+        # hybrid: always process 1 token via rollout_jit (prefill exists but graph is too large, see PREFILL_OPTIMIZATION.md)
+        if v_toks is not None:
+          out = self.rollout_jit(t[:, sp:sp+v_toks.bind(1)], sp).realize()
         else:
-          # decode phase: one token at a time via rollout
-          if v_toks is not None:
-            out = self.rollout_jit(t[:, sp:sp+v_toks.bind(1)], sp).realize()
-          else:
-            out = self.rollout_jit(t[:, sp:sp+1], sp).realize()
-          start_pos += 1
+          out = self.rollout_jit(t[:, sp:sp+1], sp).realize()
+        start_pos += 1
       elif v_toks is not None:
         nt = v_toks.bind(min(chunk_size, len(tokens) - start_pos))
         out = self(t[:, sp:sp+nt] if out is None else out, sp).realize()
