@@ -55,7 +55,9 @@ class SimpleTokenizer:
   def decode(self, ids:list[int]) -> str: return b''.join(self._tok2bytes[tid] for tid in ids).decode(errors='replace')
   def role(self, role:str):
     if self.preset == 'olmo': return self.encode("<|" + role + "|>\n")  # OLMoE Instruct format
-    if self.preset in ('qwen2', 'qwen35'): return self.encode("<|im_start|>" + role + "\n")
+    if self.preset in ('qwen2', 'qwen35'):
+      if role == 'developer': role = 'system'  # Qwen3.5 doesn't support developer role natively
+      return self.encode("<|im_start|>" + role + "\n")
     return self.encode("<|start_header_id|>" + role + "<|end_header_id|>\n\n")
   def end_turn(self, eos_id:int):
     if self.preset == 'olmo': return self.encode("\n")
@@ -376,7 +378,10 @@ class Transformer:
     self.output = nn.Linear(dim, vocab_size, bias=False)
     self.max_context = max_context
     self._cached_tokens: list[int] = []
+    self._generated_ids: set[int] = set()
     self._is_hybrid = blk is not None and any(isinstance(b, GatedDeltaNetBlock) for b in (blk or []))
+    # sampling parameters (defaults: greedy; set via configure_sampling)
+    self.temperature, self.top_k, self.top_p, self.presence_penalty = 0, 0, 1.0, 0
     # we specialize the JIT for prefill and rollout
     self.prefill_jit = TinyJit(self.forward_prefill if self._is_hybrid else self.forward)
     self.rollout_jit = TinyJit(self.forward if self._is_hybrid else self.forward)
@@ -386,6 +391,24 @@ class Transformer:
     for block in self.blk: x = block(x, start_pos)
     # TODO: add temperature
     return self.output(self.output_norm(x))[:, -1, :].softmax(-1, dtype="float").argmax(-1, keepdim=True)
+
+  def _sample(self, logits:Tensor) -> Tensor:
+    if self.temperature == 0: return logits.softmax(-1, dtype="float").argmax(-1, keepdim=True)
+    # scaled sampling with top-k + top-p (Qwen3.5 recommended: temp=1.0, top_p=0.95, top_k=20, presence_penalty=1.5)
+    logits = logits / self.temperature
+    if self.presence_penalty != 0:
+      for tid in self._generated_ids: logits[:, tid] -= self.presence_penalty
+    if self.top_k > 0:
+      val = logits.topk(self.top_k, dim=-1)[0]
+      logits = logits.where(logits >= val[:, -1:], -float('inf'))
+    probs = logits.softmax(-1, dtype="float")
+    if self.top_p < 1.0:
+      sorted_probs, sorted_idx = probs.sort(dim=-1, descending=True)
+      cumsum = sorted_probs.cumsum(axis=-1)
+      sorted_probs = sorted_probs.where(cumsum - sorted_probs <= self.top_p, 0.0)
+      probs = sorted_probs.gather(-1, sorted_idx.argsort(-1))
+      probs = probs / probs.sum(axis=-1, keepdim=True)
+    return probs.multinomial(1)
 
   def forward_prefill(self, tokens:Tensor, start_pos:int|UOp) -> Tensor:
     x = self.token_embd(tokens)                           # (B, T, D)
@@ -488,9 +511,11 @@ class Transformer:
         start_pos += 1
       # chunked prefill: keep processing until all prompt tokens are consumed
       if start_pos < len(tokens): continue
-      tokens.append(int(out.item()))
+      tok_id = int(out.item())
+      tokens.append(tok_id)
+      self._generated_ids.add(tok_id)
       self._cached_tokens = tokens[:]
-      yield tokens[-1]
+      yield tok_id
 
 models = {
   "llama3.2:1b": "https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q6_K.gguf",
@@ -572,6 +597,13 @@ class Handler(HTTPRequestHandler):
     body: dict[str, typing.Any] = json.loads(raw_body.decode("utf-8"))
     if DEBUG >= 1: print(json.dumps(body, indent=2))
     if self.path == "/v1/chat/completions":
+      # apply sampling params from request
+      model.temperature = body.get("temperature", model.temperature)
+      model.top_p = body.get("top_p", model.top_p)
+      model.top_k = body.get("top_k", model.top_k)
+      model.presence_penalty = body.get("presence_penalty", model.presence_penalty)
+      model._generated_ids.clear()
+
       # extract tokens
       ids: list[int] = [bos_id] if bos_id is not None else []
       for msg in body["messages"]:
@@ -602,6 +634,11 @@ if __name__ == "__main__":
   parser = argparse.ArgumentParser()
   parser.add_argument("--model", "-m", choices=list(models.keys()), default=list(models.keys())[0], help="Model choice")
   parser.add_argument("--max_context", type=int, default=4096, help="Max Context Length")
+  parser.add_argument("--temperature", type=float, default=0, help="Sampling temperature (0=greedy, Qwen3.5 recommends 1.0)")
+  parser.add_argument("--top_k", type=int, default=0, help="Top-k sampling (0=disabled, Qwen3.5 recommends 20)")
+  parser.add_argument("--top_p", type=float, default=1.0, help="Top-p (nucleus) sampling (1.0=disabled, Qwen3.5 recommends 0.95)")
+  parser.add_argument("--presence_penalty", type=float, default=0, help="Presence penalty (Qwen3.5 recommends 1.5 for thinking mode)")
+  parser.add_argument("--think", action="store_true", help="Enable thinking mode (inject <think> after assistant header)")
   parser.add_argument("--serve", nargs='?', type=int, const=11434, metavar="PORT", help="Run OpenAI compatible API (optional port, default 11434)")
   parser.add_argument("--benchmark", nargs='?', type=int, const=20, metavar="COUNT", help="Benchmark tok/s (optional count, default 20)")
   args = parser.parse_args()
@@ -622,6 +659,10 @@ if __name__ == "__main__":
   bos_id: int|None = kv.get('tokenizer.ggml.bos_token_id') if kv.get('tokenizer.ggml.add_bos_token', True) else None
   eos_id: int = kv['tokenizer.ggml.eos_token_id']
 
+  # apply sampling parameters
+  model.temperature, model.top_k, model.top_p = args.temperature, args.top_k, args.top_p
+  model.presence_penalty = args.presence_penalty
+
   # do benchmark
   if args.benchmark:
     gen = model.generate(toks:=[bos_id or 0])
@@ -641,11 +682,13 @@ if __name__ == "__main__":
 
   # interactive chat
   ids: list[int] = [bos_id] if bos_id is not None else []
+  think_prefix = tok.encode("<think>\n") if args.think else []
   while 1:
     try:
-      ids += tok.role("user") + tok.encode(input('>>> ')) + tok.end_turn(eos_id) + tok.role("assistant")
+      ids += tok.role("user") + tok.encode(input('>>> ')) + tok.end_turn(eos_id) + tok.role("assistant") + think_prefix
     except EOFError:
       break
+    model._generated_ids.clear()
     for next_id in model.generate(ids):
       sys.stdout.write(tok.decode([next_id]) if next_id != eos_id else "\n\n")
       sys.stdout.flush()
